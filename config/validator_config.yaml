@@ -1,0 +1,68 @@
+# Validator configuration file
+
+port: 9091                        # Axon service port
+external_ip: null                 # Axon address
+
+# Network configuration
+netuid: 397                       # Subnet ID
+subtensor:
+  network: test                   # Network type: local, test, finney
+metagraph:
+  weight_update_tempo: 105        # Number of blocks between weight updates
+
+# Wallet configuration
+wallet:
+  name: verifier
+  hotkey: verifier
+  path: ~/.bittensor/wallets
+
+# Logging configuration
+logging:
+  log_level: DEBUG
+  enable_debug: true
+  log_dir: ./logs
+
+# Database configuration
+database:
+  url: postgresql://neurons:PrygvMv3U5KjBEKtye7S@localhost:5432/neurons
+
+# Validation configuration
+validation:
+  challenge_interval: 180                   # Challenge interval (in seconds)
+  challenge_timeout: 90                     # Challenge timeout (in seconds)
+  ranking_window_minutes: 180               # Ranking window (in minutes)
+  participation_rate_threshold: 0.75        # Participation rate threshold for two-stage ranking
+  verification_concurrent: -1               # Concurrent verification tasks (-1 = cpu_count - 1, or specify positive number)
+  verification_interval: 30                 # Verification polling interval in seconds
+  challenge_type: 'gpu_matrix'              # Challenge type: 'cpu_matrix' or 'gpu_matrix'
+  
+  # CPU-specific validation configuration
+  cpu:
+    matrix_size: 2000                       # Base CPU matrix size (valid range: 100-10000)
+    size_variance: 0.1                      # Size variance percentage (±10% variance)
+    verification:
+      row_verification_count: 50            # Number of rows to verify with sampling
+      row_verification_count_variance: 0.5  # Row verification count variance (±50% variance)
+  
+  # GPU-specific validation configuration
+  gpu:
+    matrix_size: 32768                      # Base GPU matrix size (configurable for performance tuning)
+    size_variance: 0.1                      # Matrix size variance (±10% variance)
+    iterations: 1                           # Number of iterations (workload intensity)
+    enable_normalization: true              # Enable time normalization based on GPU count
+    mode: 0                                 # GPU computation mode (0=workload, 1=duration)
+    verification:
+      coordinate_sample_count: 50           # Random coordinate spot checks (set to 0 to disable)
+      coordinate_sample_count_variance: 0.2 # Random coordinate variance (±20% variance)
+      row_verification_count: 3             # Rows for sampling verification
+      row_verification_count_variance: 0.2  # Row count variance (±20% variance)
+      row_sample_rate: 0.001                # Elements per row (0.1% = 32 elements for 32K matrix)
+      abs_tolerance: 0.02                   # Absolute tolerance for FP16/FP64 comparison
+      rel_tolerance: 0.005                  # Relative tolerance (0.5%) for precision differences
+      success_rate_threshold: 0.85          # Required success rate for verification (85%)
+
+# Weight management configuration
+weight_management:
+  score_weights:
+    lease_weight: 0.70            # Lease status weight
+    challenge_weight: 0.30        # CPU matrix challenge performance

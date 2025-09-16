@@ -1,0 +1,1 @@
+"""Validator data models."""

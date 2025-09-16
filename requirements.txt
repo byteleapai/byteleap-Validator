@@ -1,0 +1,9 @@
+bittensor==9.10.0
+psutil>=5.9.0
+psycopg2-binary>=2.9.0
+sqlalchemy>=2.0.0
+alembic>=1.12.0
+cryptography>=41.0.0
+pydantic>=2.0.0
+PyYAML>=6.0.0
+loguru>=0.7.2

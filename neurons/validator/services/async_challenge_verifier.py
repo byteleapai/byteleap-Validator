@@ -4,6 +4,93 @@ Handles background verification of committed challenges using batch processing
 """
 
 import asyncio
+import concurrent.futures
+
+# --- Module-level helpers for ProcessPool workers (must be picklable) ---
+def _generate_matrix_element_worker(seed_hash: int, row: int, col: int, matrix_type: int) -> float:
+    element_id = seed_hash ^ (row << 32) ^ (col << 16) ^ matrix_type
+    element_id = element_id & 0xFFFFFFFFFFFFFFFF
+
+    # GPU cutlass_gemm.cu compatible 32-bit hash
+    hash_val = (element_id ^ (element_id >> 32)) & 0xFFFFFFFF
+    hash_val = (hash_val * 0x9E3779B9 + 0x85EBCA6B) & 0xFFFFFFFF
+    hash_val = hash_val ^ (hash_val >> 16)
+    hash_val = (hash_val * 0x85EBCA6B) & 0xFFFFFFFF
+
+    # Convert to [-1, 1] range
+    normalized = (hash_val & 0xFFFF) / 32768.0 - 1.0
+    return normalized
+
+
+def _compute_matrix_element_gemm_worker(
+    seed_hash: int, matrix_size: int, row: int, col: int, iterations: int
+) -> float:
+    result = 0.0
+    for k in range(matrix_size):
+        a_element = _generate_matrix_element_worker(seed_hash, row, k, 0)
+        b_element = _generate_matrix_element_worker(seed_hash, k, col, 1)
+        result += a_element * b_element
+    if iterations > 1:
+        result *= iterations
+    return result
+
+
+def _verify_coords_worker(
+    seed_hash: int,
+    matrix_size: int,
+    spot_check_coords: list,
+    spot_values: list,
+    iterations: int,
+    abs_tol: float,
+    rel_tol: float,
+    threshold: float,
+) -> bool:
+    if not spot_check_coords or not spot_values:
+        return True
+    if len(spot_check_coords) != len(spot_values):
+        return False
+    success = 0
+    total = len(spot_check_coords)
+    for i, coord in enumerate(spot_check_coords):
+        row, col = coord[0], coord[1]
+        expected = _compute_matrix_element_gemm_worker(
+            seed_hash, matrix_size, row, col, iterations
+        )
+        claimed = spot_values[i]
+        diff = abs(expected - claimed)
+        rel = diff / (abs(expected) + 1e-10)
+        if diff <= abs_tol or rel <= rel_tol:
+            success += 1
+    return (success / total) >= threshold
+
+
+def _verify_row_sampling_worker(
+    seed_hash: int,
+    matrix_size: int,
+    row_idx: int,
+    row_values: list,
+    iterations: int,
+    sampling_columns: list,
+    abs_tol: float,
+    rel_tol: float,
+    threshold: float,
+) -> bool:
+    if len(row_values) != matrix_size:
+        return False
+    if not sampling_columns:
+        return False
+    success = 0
+    total = len(sampling_columns)
+    for col_idx in sampling_columns:
+        expected = _compute_matrix_element_gemm_worker(
+            seed_hash, matrix_size, row_idx, col_idx, iterations
+        )
+        claimed = row_values[col_idx]
+        diff = abs(expected - claimed)
+        rel = diff / (abs(expected) + 1e-10)
+        if diff <= abs_tol or rel <= rel_tol:
+            success += 1
+    return (success / total) >= threshold
 import os
 import time
 from datetime import datetime
@@ -87,6 +174,13 @@ class AsyncChallengeVerifier:
         # Service state
         self.running = False
         self._verification_task = None
+        # Process pool for CPU-bound verification hotspots (bypass GIL)
+        try:
+            self._executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=self.concurrent_tasks
+            )
+        except Exception:
+            self._executor = None
 
         bt.logging.info(
             f"AsyncChallengeVerifier initialized: "
@@ -152,6 +246,13 @@ class AsyncChallengeVerifier:
             except asyncio.CancelledError:
                 pass
 
+        # Best-effort executor shutdown
+        try:
+            if getattr(self, "_executor", None):
+                self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
         bt.logging.info("⏹️ AsyncChallengeVerifier stopped")
 
     async def _verification_loop(self) -> None:
@@ -190,18 +291,22 @@ class AsyncChallengeVerifier:
                         f"success={success_count}, failed={fail_count}, errors={error_count}"
                     )
 
+                    # If there is backlog, loop again immediately to keep CPUs busy
+                    await asyncio.sleep(0)
                 else:
                     bt.logging.debug("No pending challenges found")
+                    # Idle backoff only when queue is empty
+                    await asyncio.sleep(self._get_verification_interval())
 
             except asyncio.CancelledError:
                 bt.logging.debug("Verification loop cancelled")
                 break
             except (ConnectionError, TimeoutError) as e:
                 bt.logging.warning(f"⚠️ Network error in verification | error={e}")
+                await asyncio.sleep(self._get_verification_interval())
             except Exception as e:
                 bt.logging.error(f"❌ Unexpected error in verification loop: {e}")
-
-            await asyncio.sleep(self._get_verification_interval())
+                await asyncio.sleep(self._get_verification_interval())
 
     def _get_oldest_verifying_challenges(self) -> List[ComputeChallenge]:
         """
@@ -1450,22 +1555,34 @@ class AsyncChallengeVerifier:
             )
             return False
 
-        success_count = 0
-        for i, coord in enumerate(spot_check_coords):
-            row, col = coord[0], coord[1]
-            expected_value = self._compute_matrix_element_gemm(
-                seed_hash, matrix_size, row, col, iterations
+        # Offload CPU-bound loop to process pool
+        loop = asyncio.get_event_loop()
+        abs_tol = self._get_abs_tolerance()
+        rel_tol = self._get_rel_tolerance()
+        threshold = self._get_success_rate_threshold()
+        if self._executor is None:
+            return _verify_coords_worker(
+                seed_hash,
+                matrix_size,
+                spot_check_coords,
+                spot_values,
+                iterations,
+                abs_tol,
+                rel_tol,
+                threshold,
             )
-            claimed_value = spot_values[i]
-
-            if self._values_match_with_tolerance(expected_value, claimed_value):
-                success_count += 1
-
-        success_rate = success_count / len(spot_check_coords)
-        bt.logging.debug(
-            f"Spot check success rate: {success_count}/{len(spot_check_coords)} ({success_rate:.1%})"
+        return await loop.run_in_executor(
+            self._executor,
+            _verify_coords_worker,
+            seed_hash,
+            matrix_size,
+            spot_check_coords,
+            spot_values,
+            iterations,
+            abs_tol,
+            rel_tol,
+            threshold,
         )
-        return success_rate >= self._get_success_rate_threshold()
 
     async def _verify_full_row_with_sampling(
         self,
@@ -1498,23 +1615,36 @@ class AsyncChallengeVerifier:
             bt.logging.error("No sampling columns provided for row verification")
             return False
 
-        success_count = 0
-        for col_idx in sampling_columns:
-            expected_value = self._compute_matrix_element_gemm(
-                seed_hash, matrix_size, row_idx, col_idx, iterations
+        # Offload CPU-bound sampling loop to process pool
+        loop = asyncio.get_event_loop()
+        abs_tol = self._get_abs_tolerance()
+        rel_tol = self._get_rel_tolerance()
+        threshold = self._get_success_rate_threshold()
+        if self._executor is None:
+            return _verify_row_sampling_worker(
+                seed_hash,
+                matrix_size,
+                row_idx,
+                row_values,
+                iterations,
+                sampling_columns,
+                abs_tol,
+                rel_tol,
+                threshold,
             )
-            claimed_value = row_values[col_idx]
-
-            if self._values_match_with_tolerance(expected_value, claimed_value):
-                success_count += 1
-
-        success_rate = (
-            success_count / len(sampling_columns) if sampling_columns else 1.0
+        return await loop.run_in_executor(
+            self._executor,
+            _verify_row_sampling_worker,
+            seed_hash,
+            matrix_size,
+            row_idx,
+            row_values,
+            iterations,
+            sampling_columns,
+            abs_tol,
+            rel_tol,
+            threshold,
         )
-        bt.logging.debug(
-            f"Row {row_idx} sampling: {success_count}/{len(sampling_columns)} coords passed ({success_rate:.1%})"
-        )
-        return success_rate >= self._get_success_rate_threshold()
 
     def _compute_row_hash_from_data(self, row_data: List[float]) -> str:
         """

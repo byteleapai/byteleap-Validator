@@ -16,6 +16,7 @@ from neurons.shared.config.config_manager import ConfigManager
 from neurons.shared.protocols import ProofData
 from neurons.validator.challenge_status import ChallengeStatus
 from neurons.validator.models.database import ComputeChallenge, DatabaseManager
+from neurons.validator.services.proof_cache import LRUProofCache
 
 
 class AsyncChallengeVerifier:
@@ -32,6 +33,7 @@ class AsyncChallengeVerifier:
         self,
         database_manager: DatabaseManager,
         config: ConfigManager,
+        proof_cache: LRUProofCache,
     ):
         """
         Initialize async verification service
@@ -39,11 +41,13 @@ class AsyncChallengeVerifier:
         Args:
             database_manager: Database manager instance
             config: Configuration manager instance
+            proof_cache: Proof cache instance
         """
         self.database_manager = database_manager
         self.config = config
+        self.proof_cache = proof_cache
 
-        # CPU cores - 1 fallback prevents system saturation
+        # Use CPU cores - 1 to prevent system saturation when configured as -1
         verification_concurrent = config.get("validation.verification_concurrent")
         if verification_concurrent == -1:
             cpu_count = os.cpu_count()
@@ -90,6 +94,41 @@ class AsyncChallengeVerifier:
             f"verification_interval={self.verification_interval}s"
         )
 
+    def _get_abs_tolerance(self) -> float:
+        return self.config.get_range(
+            "validation.gpu.verification.abs_tolerance", 0.0, 1.0, float
+        )
+
+    def _get_rel_tolerance(self) -> float:
+        return self.config.get_range(
+            "validation.gpu.verification.rel_tolerance", 0.0, 1.0, float
+        )
+
+    def _get_success_rate_threshold(self) -> float:
+        return self.config.get_range(
+            "validation.gpu.verification.success_rate_threshold", 0.0, 1.0, float
+        )
+
+    def _get_coordinate_sample_count(self) -> int:
+        return int(
+            self.config.get("validation.gpu.verification.coordinate_sample_count")
+        )
+
+    def _get_row_verification_count(self) -> int:
+        return int(
+            self.config.get("validation.gpu.verification.row_verification_count")
+        )
+
+    def _get_verification_interval(self) -> int:
+        return self.config.get_positive_number("validation.verification_interval", int)
+
+    def _get_concurrent_tasks(self) -> int:
+        configured = self.config.get("validation.verification_concurrent")
+        if configured == -1:
+            cpu_count = os.cpu_count() or 1
+            return max(1, int(cpu_count) - 1)
+        return max(1, int(configured))
+
     async def start(self) -> None:
         """Start the async verification service"""
         if self.running:
@@ -122,7 +161,7 @@ class AsyncChallengeVerifier:
         while self.running:
             try:
                 # Get oldest pending challenges
-                pending_challenges = self._get_oldest_committed_challenges()
+                pending_challenges = self._get_oldest_verifying_challenges()
 
                 if pending_challenges:
                     bt.logging.debug(
@@ -152,7 +191,6 @@ class AsyncChallengeVerifier:
                     )
 
                 else:
-                    # No pending challenges, log periodically
                     bt.logging.debug("No pending challenges found")
 
             except asyncio.CancelledError:
@@ -163,12 +201,11 @@ class AsyncChallengeVerifier:
             except Exception as e:
                 bt.logging.error(f"❌ Unexpected error in verification loop: {e}")
 
-            # Wait before next verification cycle
-            await asyncio.sleep(self.verification_interval)
+            await asyncio.sleep(self._get_verification_interval())
 
-    def _get_oldest_committed_challenges(self) -> List[ComputeChallenge]:
+    def _get_oldest_verifying_challenges(self) -> List[ComputeChallenge]:
         """
-        Get oldest pending challenges for verification
+        Get oldest pending challenges in VERIFYING state for verification
 
         Returns:
             List of pending challenges ordered by creation time
@@ -178,11 +215,11 @@ class AsyncChallengeVerifier:
                 challenges = (
                     session.query(ComputeChallenge)
                     .filter(
-                        ComputeChallenge.challenge_status == "verifying",
+                        ComputeChallenge.challenge_status == ChallengeStatus.VERIFYING,
                         ComputeChallenge.deleted_at.is_(None),
                     )
                     .order_by(ComputeChallenge.created_at.asc())
-                    .limit(self.concurrent_tasks)
+                    .limit(self._get_concurrent_tasks())
                     .all()
                 )
 
@@ -207,7 +244,7 @@ class AsyncChallengeVerifier:
 
         try:
             bt.logging.debug(
-                f"🔍 Starting verification for challenge {challenge.challenge_id}"
+                f"start verification | challenge_id={challenge.challenge_id}"
             )
 
             # Create mock proof data from challenge
@@ -259,9 +296,15 @@ class AsyncChallengeVerifier:
                     self._update_challenge_gpu_activity(session, db_challenge, success)
 
                     bt.logging.debug(
-                        f"Challenge {challenge.challenge_id} verification "
-                        f"{'succeeded' if success else 'failed'} ({verification_time_ms:.1f}ms)"
+                        f"verification done | challenge_id={challenge.challenge_id} "
+                        f"success={success} duration_ms={verification_time_ms:.1f}"
                     )
+
+                    # Remove cached proof for this hotkey after processing
+                    try:
+                        self.proof_cache.remove_proof(db_challenge.hotkey)
+                    except Exception:
+                        pass
 
             return success, verification_details
 
@@ -303,6 +346,12 @@ class AsyncChallengeVerifier:
 
                         session.commit()
 
+                        # Best-effort cache cleanup on failure
+                        try:
+                            self.proof_cache.remove_proof(db_challenge.hotkey)
+                        except Exception:
+                            pass
+
             except (IntegrityError, OperationalError, DatabaseError) as db_error:
                 bt.logging.error(
                     f"Database error updating failed challenge status: {db_error}"
@@ -331,7 +380,6 @@ class AsyncChallengeVerifier:
         gpu_count = 0
 
         for gpu_uuid, merkle_root in db_challenge.merkle_commitments.items():
-            # CPU challenges use UUID "-1"
             if gpu_uuid != "-1":
                 try:
                     self.database_manager.update_gpu_activity(
@@ -367,19 +415,25 @@ class AsyncChallengeVerifier:
         """
         challenge_type = challenge.challenge_type
 
-        # Proof data required for verification
-        if not challenge.verification_data:
+        cached_proof = self.proof_cache.get_proof(challenge.hotkey)
+        if not cached_proof:
             bt.logging.error(
-                f"No response data found for challenge {challenge.challenge_id}"
+                f"No cached proof data found for challenge {challenge.challenge_id}, hotkey={challenge.hotkey[:8]}..."
             )
-            return False, {"error": "No response data"}
+            return False, {"error": "No cached proof data"}
 
-        proof_data = challenge.verification_data.get("proofs", {})
+        if cached_proof.get("challenge_id") != challenge.challenge_id:
+            bt.logging.error(
+                f"Cached proof challenge_id mismatch: expected={challenge.challenge_id}, cached={cached_proof.get('challenge_id')}"
+            )
+            return False, {"error": "Challenge ID mismatch"}
+
+        proof_data = cached_proof.get("proofs", {})
         if not proof_data:
             bt.logging.error(
-                f"No proof data found for challenge {challenge.challenge_id}"
+                f"No proof data in cache for challenge {challenge.challenge_id}"
             )
-            return False, {"error": "No proof data"}
+            return False, {"error": "No proof data in cache"}
 
         if challenge_type == "cpu_matrix":
             return await self._verify_cpu_challenge(challenge, proof_data)
@@ -396,7 +450,7 @@ class AsyncChallengeVerifier:
         bt.logging.debug(f"CPU challenge verify | id={challenge.challenge_id}")
 
         try:
-            # CPU proof uses UUID "-1"
+
             cpu_proof = proof_data.get("-1")
             if not cpu_proof:
                 bt.logging.error(
@@ -404,12 +458,11 @@ class AsyncChallengeVerifier:
                 )
                 return False, {"error": "No CPU proof found"}
 
-            # Get challenge parameters
             challenge_data = challenge.challenge_data
             seed = bytes.fromhex(challenge_data["seed"])
             matrix_size = challenge_data["matrix_size"]
+            iterations = challenge_data.get("iterations", 1)
 
-            # Get trusted verification targets
             trusted_rows_to_check = challenge.verification_targets or []
             trusted_rows = [
                 item[0] for item in trusted_rows_to_check if item[1] is None
@@ -421,7 +474,6 @@ class AsyncChallengeVerifier:
                 )
                 return False, {"error": "No trusted rows"}
 
-            # Get commitment
             commitment_merkle_root = challenge.merkle_commitments or {}
             expected_merkle_root = commitment_merkle_root.get("-1")
             if not expected_merkle_root:
@@ -441,6 +493,7 @@ class AsyncChallengeVerifier:
                 proof_data=cpu_proof,
                 expected_merkle_root=expected_merkle_root,
                 trusted_rows=trusted_rows,
+                iterations=iterations,
             )
 
             # Create detailed verification statistics
@@ -590,6 +643,7 @@ class AsyncChallengeVerifier:
         proof_data: Dict,
         expected_merkle_root: str,
         trusted_rows: List[int],
+        iterations: int = 1,
     ) -> bool:
         """CPU matrix verification with full row computation"""
         try:
@@ -613,7 +667,7 @@ class AsyncChallengeVerifier:
 
             # Step 1: Verify row hashes against re-computed hashes
             expected_hashes = await self._compute_cpu_matrix_rows(
-                seed, matrix_size, trusted_rows
+                seed, matrix_size, trusted_rows, iterations
             )
 
             if len(row_hashes) != len(expected_hashes):
@@ -1120,7 +1174,7 @@ class AsyncChallengeVerifier:
             # Row threshold: based on configured sample rate
             row_cache_threshold = max(10, int(matrix_size * row_sample_rate))
             # Column threshold: each fixed column is shared by ~row_verification_count rows
-            col_cache_threshold = max(5, int(self.row_verification_count * 0.8))
+            col_cache_threshold = max(5, int(self._get_row_verification_count() * 0.8))
 
             # Determine which rows/columns should be cached with separate thresholds
             cache_rows = [
@@ -1214,7 +1268,7 @@ class AsyncChallengeVerifier:
                 success_count += 1
 
         success_rate = success_count / len(random_coords) if random_coords else 1.0
-        return success_rate >= self.success_rate_threshold
+        return success_rate >= self._get_success_rate_threshold()
 
     async def _verify_coordinates(
         self,
@@ -1314,7 +1368,7 @@ class AsyncChallengeVerifier:
                 f"{len(verified_rows)} rows fully verified"
             )
 
-            return success_rate >= self.success_rate_threshold, verified_rows
+            return success_rate >= self._get_success_rate_threshold(), verified_rows
 
         except Exception as e:
             bt.logging.error(f"Coordinate verification error: {e}")
@@ -1411,7 +1465,7 @@ class AsyncChallengeVerifier:
         bt.logging.debug(
             f"Spot check success rate: {success_count}/{len(spot_check_coords)} ({success_rate:.1%})"
         )
-        return success_rate >= self.success_rate_threshold
+        return success_rate >= self._get_success_rate_threshold()
 
     async def _verify_full_row_with_sampling(
         self,
@@ -1460,7 +1514,7 @@ class AsyncChallengeVerifier:
         bt.logging.debug(
             f"Row {row_idx} sampling: {success_count}/{len(sampling_columns)} coords passed ({success_rate:.1%})"
         )
-        return success_rate >= self.success_rate_threshold
+        return success_rate >= self._get_success_rate_threshold()
 
     def _compute_row_hash_from_data(self, row_data: List[float]) -> str:
         """
@@ -1531,7 +1585,7 @@ class AsyncChallengeVerifier:
             )
 
             bt.logging.debug(
-                f"FALLBACK caching: {len(rows_needed)} A-matrix rows + {len(cols_needed)} B-matrix columns "
+                f"Selected caching plan: {len(rows_needed)} A-matrix rows + {len(cols_needed)} B-matrix columns "
                 f"(~{efficiency_gain:.1f}x detected efficiency)"
             )
 
@@ -1587,7 +1641,7 @@ class AsyncChallengeVerifier:
         bt.logging.debug(
             f"Sampling verification: {success_rate:.1%} success rate, cache efficiency: {cache_efficiency:.1f}x"
         )
-        return success_rate >= self.success_rate_threshold
+        return success_rate >= self._get_success_rate_threshold()
 
     async def _verify_row_sampling_coordinates(
         self,
@@ -1624,7 +1678,7 @@ class AsyncChallengeVerifier:
         success_rate = (
             success_count / len(row_sampling_coords) if row_sampling_coords else 0.0
         )
-        return success_rate >= self.success_rate_threshold
+        return success_rate >= self._get_success_rate_threshold()
 
     def _compute_matrix_element_gemm(
         self, seed_hash: int, matrix_size: int, row: int, col: int, iterations: int = 1
@@ -1684,7 +1738,10 @@ class AsyncChallengeVerifier:
         abs_diff = abs(expected - claimed)
         rel_diff = abs_diff / (abs(expected) + 1e-10)
 
-        return abs_diff <= self.abs_tolerance or rel_diff <= self.rel_tolerance
+        return (
+            abs_diff <= self._get_abs_tolerance()
+            or rel_diff <= self._get_rel_tolerance()
+        )
 
     async def _compute_cpu_matrix_rows(
         self, seed: bytes, matrix_size: int, row_indices: List[int], iterations: int = 1
@@ -1698,9 +1755,8 @@ class AsyncChallengeVerifier:
 
             import numpy as np
 
-            from neurons.shared.challenges.cpu_matrix_challenge import (
-                CPUMatrixChallenge,
-            )
+            from neurons.shared.challenges.cpu_matrix_challenge import \
+                CPUMatrixChallenge
 
             # Generate matrices with trusted parameters
             matrix_a, matrix_b = CPUMatrixChallenge._generate_matrices_from_seed(
@@ -1719,7 +1775,8 @@ class AsyncChallengeVerifier:
             expected_hashes = []
             for row_idx in row_indices:
                 computed_row = result[row_idx]
-                expected_hash = hashlib.sha256(computed_row.tobytes()).hexdigest()
+                # Match worker hashing format: SHA-256 hex truncated to 16 chars
+                expected_hash = hashlib.sha256(computed_row.tobytes()).hexdigest()[:16]
                 expected_hashes.append(expected_hash)
 
             bt.logging.debug(
@@ -1823,7 +1880,7 @@ class AsyncChallengeVerifier:
         try:
             with self.database_manager.get_session() as session:
                 # Simple query to test connectivity
-                pending_challenges = self._get_oldest_committed_challenges()
+                pending_challenges = self._get_oldest_verifying_challenges()
                 health_status["database_accessible"] = True
                 health_status["pending_challenges_pending"] = len(pending_challenges)
         except Exception as e:

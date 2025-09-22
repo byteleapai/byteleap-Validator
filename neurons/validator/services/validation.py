@@ -18,13 +18,11 @@ from neurons.shared.crypto import CryptoManager
 from neurons.shared.protocols import ComputeChallenge
 from neurons.shared.utils.error_handler import ErrorHandler, ValidationError
 from neurons.validator.challenge_status import ChallengeStatus
-from neurons.validator.models.database import (
-    ComputeChallenge,
-    DatabaseManager,
-    MinerInfo,
-    WorkerInfo,
-)
-from neurons.validator.services.worker_performance_ranker import WorkerPerformanceRanker
+from neurons.validator.models.database import (ComputeChallenge,
+                                               DatabaseManager, MinerInfo,
+                                               WorkerInfo)
+from neurons.validator.services.worker_performance_ranker import \
+    WorkerPerformanceRanker
 
 
 class MinerValidationService:
@@ -44,7 +42,7 @@ class MinerValidationService:
         subtensor: bt.subtensor,
         metagraph: bt.metagraph,
         config,
-        wallet: Optional[bt.wallet] = None,
+        wallet: bt.wallet,
     ):
         """
         Initialize validation service
@@ -65,27 +63,17 @@ class MinerValidationService:
         self.metagraph = metagraph
         self.config = config
 
-        # Initialize configuration validator
-        # Validate required configuration keys
         self.netuid = config.get_positive_number("netuid", int)
         self.challenge_interval = config.get_positive_number(
             "validation.challenge_interval", int
-        )
-        self.challenge_timeout = config.get_positive_number(
-            "validation.challenge_timeout", int
         )
         self.participation_rate_threshold = config.get_range(
             "validation.participation_rate_threshold", 0.1, 1.0, float
         )
 
-        # Challenge configuration
         self.challenge_type = config.get_non_empty_string("validation.challenge_type")
-
-        # CPU-specific configuration - all required
         self.matrix_size = config.get("validation.cpu.matrix_size")
         self.size_variance = config.get("validation.cpu.size_variance")
-
-        # GPU-specific configuration - all required
         self.gpu_matrix_size = config.get("validation.gpu.matrix_size")
         self.gpu_size_variance = config.get("validation.gpu.size_variance")
         self.gpu_iterations = config.get("validation.gpu.iterations")
@@ -94,10 +82,8 @@ class MinerValidationService:
         )
         self.gpu_mode = config.get("validation.gpu.mode")
 
-        # Challenge management components
-        self.validator_hotkey = wallet.hotkey.ss58_address if wallet else ""
+        self.validator_hotkey = wallet.hotkey.ss58_address
 
-        # CPU verification configuration
         self.cpu_row_verification_count = config.get(
             "validation.cpu.verification.row_verification_count"
         )
@@ -105,7 +91,6 @@ class MinerValidationService:
             "validation.cpu.verification.row_verification_count_variance"
         )
 
-        # GPU verification configuration
         self.coordinate_sample_count = config.get(
             "validation.gpu.verification.coordinate_sample_count"
         )
@@ -141,13 +126,11 @@ class MinerValidationService:
             database_manager, self.challenge_interval, self.participation_rate_threshold
         )
 
-        # Runtime status
         self.is_running = False
         self._validation_task: Optional[asyncio.Task] = None
         self._current_round_id = None
-        self._startup_cleanup_done = False  # Flag to track startup cleanup completion
+        self._startup_cleanup_done = False
 
-        # Anti-replay protection
         self._used_challenges: Dict[str, float] = {}
 
         bt.logging.info("🚀 Validation service initialized")
@@ -198,8 +181,15 @@ class MinerValidationService:
                     # Clean up expired challenges
                     self._cleanup_expired_challenges()
 
-                # Wait for next validation cycle
-                await asyncio.sleep(self.challenge_interval)
+                # Wait for next validation cycle (dynamic)
+                try:
+                    interval = self.config.get_positive_number(
+                        "validation.challenge_interval", int
+                    )
+                except Exception:
+                    # Fall back to previously validated value
+                    interval = self.challenge_interval
+                await asyncio.sleep(interval)
 
             except Exception as e:
                 ErrorHandler.log_error(
@@ -211,7 +201,7 @@ class MinerValidationService:
                 await asyncio.sleep(10)
 
     async def _validate_online_miners(self) -> None:
-        """Validate all currently online miners with active workers"""
+        """Validate all online miners with active workers"""
         with self.db_manager.get_session() as session:
             online_miners = self.db_manager.get_online_miners(session)
 
@@ -238,13 +228,17 @@ class MinerValidationService:
         Returns:
             True if miner needs validation based on time intervals
         """
-        # Miners without challenge history need immediate validation
         if miner.last_challenge_time is None:
             return True
 
-        # Check time since last validation
+        try:
+            interval = self.config.get_positive_number(
+                "validation.challenge_interval", int
+            )
+        except Exception:
+            interval = self.challenge_interval
         time_since_last_challenge = datetime.utcnow() - miner.last_challenge_time
-        return time_since_last_challenge.total_seconds() >= self.challenge_interval
+        return time_since_last_challenge.total_seconds() >= interval
 
     async def _create_challenge_for_miner(self, miner: MinerInfo) -> Optional[int]:
         """
@@ -260,12 +254,10 @@ class MinerValidationService:
             Number of challenges created, None if creation failed
         """
         try:
-            # Generate round ID and timestamp for batch challenges
             round_id = f"round_{int(time.time())}"
             challenge_timestamp = time.time()
 
             with self.db_manager.get_session() as session:
-                # Get active workers for this miner
                 workers = (
                     session.query(WorkerInfo)
                     .filter(
@@ -282,17 +274,16 @@ class MinerValidationService:
                     bt.logging.warning(f"⚠️ No active workers | hotkey={miner.hotkey}")
                     return 0
 
-                # Filter workers eligible for challenges
+                # Determine required capability (challenge type) once per batch (fail-fast)
+                dyn_type = self.config.get_non_empty_string("validation.challenge_type")
+
                 eligible_workers = []
                 for worker in workers:
-                    # Skip leased workers
                     if worker.lease_score and worker.lease_score > 0.0:
                         bt.logging.debug(
                             f"Skip leased worker | id={worker.worker_id} lease_score={worker.lease_score}"
                         )
                         continue
-
-                    # Check challenge capability support
                     worker_capabilities = worker.capabilities or []
                     has_cpu = "cpu_matrix" in worker_capabilities
                     has_gpu = "gpu_matrix" in worker_capabilities
@@ -302,29 +293,28 @@ class MinerValidationService:
                             f"Skip worker | id={worker.worker_id} reason=missing_capabilities has={worker_capabilities}"
                         )
                         continue
-
-                    unsent_challenges = (
+                    pending_challenges = (
                         session.query(ComputeChallenge)
                         .filter(
                             ComputeChallenge.worker_id == worker.worker_id,
-                            ComputeChallenge.challenge_status
-                            == ChallengeStatus.CREATED,
+                            ComputeChallenge.challenge_status.in_(
+                                [ChallengeStatus.CREATED, ChallengeStatus.VERIFYING]
+                            ),
                             ComputeChallenge.deleted_at.is_(None),
                         )
                         .count()
                     )
 
-                    if unsent_challenges > 0:
+                    if pending_challenges > 0:
                         bt.logging.debug(
                             f"Skipping worker {worker.worker_id} - "
-                            f"{unsent_challenges} pending unsent challenges exist"
+                            f"{pending_challenges} pending challenges exist (CREATED/VERIFYING)"
                         )
                         continue
-
-                        # Filter workers based on validator's challenge_type configuration
                     worker_capabilities = worker.capabilities or []
+
                     if (
-                        self.challenge_type == "gpu_matrix"
+                        dyn_type == "gpu_matrix"
                         and "gpu_matrix" not in worker_capabilities
                     ):
                         bt.logging.debug(
@@ -332,7 +322,7 @@ class MinerValidationService:
                         )
                         continue
                     elif (
-                        self.challenge_type == "cpu_matrix"
+                        dyn_type == "cpu_matrix"
                         and "cpu_matrix" not in worker_capabilities
                     ):
                         bt.logging.debug(
@@ -345,38 +335,58 @@ class MinerValidationService:
                 if not eligible_workers:
                     bt.logging.info(
                         f"No eligible workers found for miner {miner.hotkey} "
-                        f"(required capability: {self.challenge_type})"
+                        f"(required capability: {dyn_type})"
                     )
                     return 0
 
+                current_challenge_type = self.config.get_non_empty_string(
+                    "validation.challenge_type"
+                )
+
                 bt.logging.info(
                     f"Creating batch challenges for {len(eligible_workers)} eligible workers "
-                    f"from miner {miner.hotkey} (round: {round_id}, mode: {self.challenge_type})"
+                    f"from miner {miner.hotkey} (round: {round_id}, mode: {current_challenge_type})"
                 )
                 batch_challenges = []
                 for worker in eligible_workers:
                     try:
-                        # Generate challenge based on validator's configured challenge type
-                        if self.challenge_type == "gpu_matrix":
+                        if current_challenge_type == "gpu_matrix":
+                            gpu_matrix_size = self.config.get(
+                                "validation.gpu.matrix_size"
+                            )
+                            gpu_size_variance = self.config.get(
+                                "validation.gpu.size_variance"
+                            )
+                            gpu_iterations = self.config.get(
+                                "validation.gpu.iterations"
+                            )
+                            gpu_mode = self.config.get("validation.gpu.mode")
+
                             challenge_data = GPUMatrixChallenge.generate_challenge(
-                                matrix_size=self.gpu_matrix_size,
+                                matrix_size=gpu_matrix_size,
                                 validator_hotkey=self.validator_hotkey,
-                                enable_dynamic_size=self.gpu_size_variance > 0,
-                                size_variance=self.gpu_size_variance,
-                                iterations=self.gpu_iterations,
-                                mode=self.gpu_mode,
+                                enable_dynamic_size=gpu_size_variance > 0,
+                                size_variance=gpu_size_variance,
+                                iterations=gpu_iterations,
+                                mode=gpu_mode,
                             )
                             challenge_data["challenge_type"] = "gpu_matrix"
-                        else:  # cpu_matrix
+                        else:
+                            cpu_matrix_size = self.config.get(
+                                "validation.cpu.matrix_size"
+                            )
+                            cpu_size_variance = self.config.get(
+                                "validation.cpu.size_variance"
+                            )
                             cpu_iterations = self.config.get(
                                 "validation.cpu.iterations"
                             )
 
                             challenge_data = CPUMatrixChallenge.generate_challenge(
-                                matrix_size=self.matrix_size,
+                                matrix_size=cpu_matrix_size,
                                 validator_hotkey=self.validator_hotkey,
-                                enable_dynamic_size=self.size_variance > 0,
-                                size_variance=self.size_variance,
+                                enable_dynamic_size=cpu_size_variance > 0,
+                                size_variance=cpu_size_variance,
                                 iterations=cpu_iterations,
                             )
                             challenge_data["challenge_type"] = "cpu_matrix"
@@ -402,17 +412,21 @@ class MinerValidationService:
                     worker = challenge_info["worker"]
 
                     try:
+                        dyn_timeout = self.config.get_positive_number(
+                            "validation.challenge_timeout", int
+                        )
+
                         self.db_manager.record_challenge(
                             session=session,
                             challenge_id=challenge_data["challenge_id"],
                             hotkey=miner.hotkey,
                             challenge_type=challenge_data.get(
-                                "challenge_type", self.challenge_type
+                                "challenge_type", current_challenge_type
                             ),
                             challenge_data=challenge_data,
                             matrix_size=challenge_data["matrix_size"],
                             worker_id=worker.worker_id,
-                            challenge_timeout=self.challenge_timeout,
+                            challenge_timeout=dyn_timeout,
                         )
                     except Exception as db_error:
                         bt.logging.warning(
@@ -460,7 +474,7 @@ class MinerValidationService:
                 )
 
                 if remaining_unsent > 0:
-                    bt.logging.debug(f"📦 Unsent challenges | count={remaining_unsent}")
+                    bt.logging.debug(f"Unsent challenges | count={remaining_unsent}")
 
         except Exception as e:
             bt.logging.error(f"❌ Cleanup error | error={e}")
@@ -493,12 +507,12 @@ class MinerValidationService:
 
             if expired_worker_submissions:
                 bt.logging.debug(
-                    f"📋 Cleaned {len(expired_worker_submissions)} worker submission records"
+                    f"Cleaned {len(expired_worker_submissions)} worker submission records"
                 )
 
         if expired_used_challenges:
             bt.logging.debug(
-                f"📋 Cleaned {len(expired_used_challenges)} challenge tracking records"
+                f"Cleaned {len(expired_used_challenges)} challenge tracking records"
             )
 
     def get_miner_validation_stats(self, hotkey: str) -> Dict[str, Any]:
@@ -578,14 +592,27 @@ class MinerValidationService:
                 .count()
             )
 
+        # Reflect dynamic config values in status (fail-fast)
+        dyn_challenge_type = self.config.get_non_empty_string(
+            "validation.challenge_type"
+        )
+        dyn_interval = self.config.get_positive_number(
+            "validation.challenge_interval", int
+        )
+        dyn_pr = self.config.get_range(
+            "validation.participation_rate_threshold", 0.1, 1.0, float
+        )
+        dyn_cpu_size = self.config.get("validation.cpu.matrix_size")
+        dyn_gpu_size = self.config.get("validation.gpu.matrix_size")
+
         return {
             "is_running": self.is_running,
             "pending_challenges": pending_challenges_count,
-            "challenge_type": self.challenge_type,
-            "challenge_interval": self.challenge_interval,
-            "participation_rate_threshold": self.participation_rate_threshold,
-            "cpu_matrix_stats": {"current_matrix_size": self.matrix_size},
-            "gpu_matrix_stats": {"current_matrix_size": self.gpu_matrix_size},
+            "challenge_type": dyn_challenge_type,
+            "challenge_interval": dyn_interval,
+            "participation_rate_threshold": dyn_pr,
+            "cpu_matrix_stats": {"current_matrix_size": dyn_cpu_size},
+            "gpu_matrix_stats": {"current_matrix_size": dyn_gpu_size},
         }
 
     def get_security_status(self) -> Dict[str, Any]:
@@ -626,7 +653,9 @@ class MinerValidationService:
                 "old_used_challenges": old_used_challenges,
             },
             "security_config": {
-                "challenge_timeout": self.challenge_timeout,
+                "challenge_timeout": self.config.get_positive_number(
+                    "validation.challenge_timeout", int
+                ),
                 "used_challenge_cleanup_interval": CryptoManager.USED_CHALLENGE_CLEANUP_INTERVAL_SECONDS,
             },
         }

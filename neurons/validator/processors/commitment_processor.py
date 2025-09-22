@@ -11,12 +11,8 @@ from typing import Any, Dict, List, Tuple, Type
 
 import bittensor as bt
 
-from neurons.shared.protocols import (
-    ChallengeSynapse,
-    Commitment,
-    CommitmentData,
-    ProofRequest,
-)
+from neurons.shared.protocols import (ChallengeSynapse, Commitment,
+                                      CommitmentData, ProofRequest)
 from neurons.shared.utils.error_handler import ErrorHandler
 from neurons.validator.challenge_status import ChallengeStatus
 from neurons.validator.models.database import ComputeChallenge
@@ -69,7 +65,7 @@ class MerkleSignatureVerifier:
             try:
                 signature_bytes = bytes.fromhex(signature_hex)
             except ValueError:
-                # Try base64 fallback
+                # Decode using base64 if hex parsing fails
                 signature_bytes = base64.b64decode(signature_hex, validate=True)
             public_key_bytes = bytes.fromhex(
                 MerkleSignatureVerifier.MERKLE_PUBLIC_KEY_HEX
@@ -139,11 +135,50 @@ class MerkleSignatureVerifier:
 class CommitmentProcessor(SynapseProcessor):
     """Process commitment submissions (Phase 1 of two-phase verification)"""
 
-    def __init__(self, communicator, database_manager, verification_config):
+    def __init__(
+        self, communicator, database_manager, verification_config, config=None
+    ):
         super().__init__(communicator)
         self.database_manager = database_manager
         self.error_handler = ErrorHandler()
         self.verification_config = verification_config
+        self.config = config
+
+    def _get_cpu_row_count(self) -> int:
+        return int(
+            self.config.get("validation.cpu.verification.row_verification_count")
+        )
+
+    def _get_cpu_row_variance(self) -> float:
+        return float(
+            self.config.get(
+                "validation.cpu.verification.row_verification_count_variance"
+            )
+        )
+
+    def _get_gpu_coord_count(self) -> int:
+        return int(
+            self.config.get("validation.gpu.verification.coordinate_sample_count")
+        )
+
+    def _get_gpu_coord_variance(self) -> float:
+        return float(
+            self.config.get(
+                "validation.gpu.verification.coordinate_sample_count_variance"
+            )
+        )
+
+    def _get_gpu_row_count(self) -> int:
+        return int(
+            self.config.get("validation.gpu.verification.row_verification_count")
+        )
+
+    def _get_gpu_row_variance(self) -> float:
+        return float(
+            self.config.get(
+                "validation.gpu.verification.row_verification_count_variance"
+            )
+        )
 
     @property
     def synapse_type(self) -> Type[ChallengeSynapse]:
@@ -373,10 +408,8 @@ class CommitmentProcessor(SynapseProcessor):
         Security: Uses validator-controlled randomness to prevent gaming
         """
         try:
-            base_row_count = self.verification_config.get("cpu_row_verification_count")
-            row_variance = self.verification_config.get(
-                "cpu_row_verification_count_variance"
-            )
+            base_row_count = self._get_cpu_row_count()
+            row_variance = self._get_cpu_row_variance()
 
             # Apply random variance
             if row_variance > 0:
@@ -412,10 +445,8 @@ class CommitmentProcessor(SynapseProcessor):
         Coordinates are stored in verification_targets field as coordinate pairs
         """
         try:
-            base_coord_count = self.verification_config.get("coordinate_sample_count")
-            coord_variance = self.verification_config.get(
-                "coordinate_sample_count_variance"
-            )
+            base_coord_count = self._get_gpu_coord_count()
+            coord_variance = self._get_gpu_coord_variance()
 
             # Apply random variance
             if coord_variance > 0:
@@ -478,10 +509,8 @@ class CommitmentProcessor(SynapseProcessor):
         try:
             crypto_random = secrets.SystemRandom()
 
-            base_coord_count = self.verification_config.get("coordinate_sample_count")
-            coord_variance = self.verification_config.get(
-                "coordinate_sample_count_variance"
-            )
+            base_coord_count = self._get_gpu_coord_count()
+            coord_variance = self._get_gpu_coord_variance()
 
             spot_check_coords = []
             coordinate_set = set()
@@ -511,10 +540,8 @@ class CommitmentProcessor(SynapseProcessor):
 
                         attempts += 1
 
-            base_row_count = self.verification_config.get("row_verification_count")
-            row_variance = self.verification_config.get(
-                "row_verification_count_variance"
-            )
+            base_row_count = self._get_gpu_row_count()
+            row_variance = self._get_gpu_row_variance()
 
             verification_rows = []
 

@@ -8,24 +8,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import bittensor as bt
 
 from neurons.shared.crypto import CryptoManager
-from neurons.shared.protocols import (
-    ChallengeProofSynapse,
-    ChallengeSynapse,
-)
+from neurons.shared.protocols import ChallengeProofSynapse, ChallengeSynapse
 from neurons.shared.protocols import EncryptedSynapse as BaseSynapse
-from neurons.shared.protocols import (
-    HeartbeatSynapse,
-    SessionInitSynapse,
-    TaskSynapse,
-)
-from neurons.validator.models.database import (
-    DatabaseManager,
-    MinerInfo,
-    NetworkLog,
-    WorkerInfo,
-)
-from neurons.validator.services.communication import ValidatorCommunicationService
-from neurons.validator.services.processor_factory import ValidatorProcessorFactory
+from neurons.shared.protocols import (HeartbeatSynapse, SessionInitSynapse,
+                                      TaskSynapse)
+from neurons.validator.challenge_status import ChallengeStatus
+from neurons.validator.models.database import (DatabaseManager, MinerInfo,
+                                               NetworkLog, WorkerInfo)
+from neurons.validator.services.communication import \
+    ValidatorCommunicationService
+from neurons.validator.services.data_cleanup import DataCleanupService
+from neurons.validator.services.meshhub_client import MeshHubClient
+from neurons.validator.services.processor_factory import \
+    ValidatorProcessorFactory
 from neurons.validator.services.validation import MinerValidationService
 from neurons.validator.services.weight_manager import WeightManager
 
@@ -82,6 +77,14 @@ class Validator:
         database_url = self.config.get_non_empty_string("database.url")
         self.database_manager = DatabaseManager(database_url)
 
+        # Proof cache for challenge verification data
+        from neurons.validator.services.proof_cache import LRUProofCache
+
+        max_size = self.config.get_positive_number(
+            "validation.proof_queue_max_size", int
+        )
+        self.proof_cache = LRUProofCache(max_size)
+
         # Communication system
         self.communicator = ValidatorCommunicationService(
             self.wallet, config, self.database_manager
@@ -90,8 +93,32 @@ class Validator:
         self.validation_service = MinerValidationService(
             self.database_manager, self.subtensor, self.metagraph, config, self.wallet
         )
+        # MeshHub client
+        self._fatal_reason: Optional[str] = None
+        self.meshhub_client = MeshHubClient(
+            self.wallet, config, self.database_manager, on_fatal=self._on_meshhub_fatal
+        )
         self.weight_manager = WeightManager(
-            self.database_manager, self.wallet, self.subtensor, self.metagraph, config
+            self.database_manager,
+            self.wallet,
+            self.subtensor,
+            self.metagraph,
+            config,
+            meshhub_client=self.meshhub_client,
+        )
+        # Data retention / cleanup service (startup + nightly)
+        try:
+            retention_days = self.config.get_positive_number(
+                "database.event_retention_days", int
+            )
+        except Exception as e:
+            # Fail-fast inside neurons/: propagate after logging for clarity
+            bt.logging.error(
+                f"❌ Config invalid | key=database.event_retention_days error={e}"
+            )
+            raise
+        self.data_cleanup_service = DataCleanupService(
+            self.database_manager, retention_days=retention_days
         )
 
         # Create verification config for async verification service
@@ -109,12 +136,11 @@ class Validator:
         }
 
         # Async verification service for background challenge verification
-        from neurons.validator.services.async_challenge_verifier import (
-            AsyncChallengeVerifier,
-        )
+        from neurons.validator.services.async_challenge_verifier import \
+            AsyncChallengeVerifier
 
         self.async_challenge_verifier = AsyncChallengeVerifier(
-            self.database_manager, config
+            self.database_manager, config, self.proof_cache
         )
 
         # Register communication processors
@@ -137,17 +163,52 @@ class Validator:
 
         bt.logging.info("✅ Validator initialization complete")
 
+    def _on_meshhub_fatal(self, reason: str) -> None:
+        """Gracefully request shutdown on MeshHub fatal errors (e.g., invalid token)."""
+        self._fatal_reason = reason or "meshhub_fatal"
+        self._shutdown_event.set()
+
+    def _cleanup_interrupted_challenges(self) -> None:
+        """Clean up challenges that were interrupted during previous restart"""
+        try:
+            with self.database_manager.get_session() as session:
+                # Deferred import to avoid circulars
+                from neurons.validator.models.database import ComputeChallenge
+
+                # Find all VERIFYING challenges (interrupted verification)
+                interrupted_challenges = (
+                    session.query(ComputeChallenge)
+                    .filter(
+                        ComputeChallenge.challenge_status == ChallengeStatus.VERIFYING,
+                        ComputeChallenge.deleted_at.is_(None),
+                    )
+                    .all()
+                )
+
+                if interrupted_challenges:
+                    for challenge in interrupted_challenges:
+                        challenge.challenge_status = ChallengeStatus.FAILED
+                        challenge.verification_result = False
+                        challenge.verification_notes = (
+                            "Validator restart - verification interrupted"
+                        )
+                        challenge.verified_at = datetime.utcnow()
+
+                    session.commit()
+                    bt.logging.info(
+                        f"🔄 Restart cleanup | failed={len(interrupted_challenges)} interrupted challenges"
+                    )
+
+        except Exception as e:
+            bt.logging.error(f"❌ Restart cleanup error | error={e}")
+
     def _register_processors(self) -> None:
         """Register synapse processors for communication"""
-        from neurons.shared.protocols import (
-            ChallengeProofSynapse,
-            ChallengeSynapse,
-            HeartbeatSynapse,
-            TaskSynapse,
-        )
-        from neurons.validator.processors.commitment_processor import (
-            CommitmentProcessor,
-        )
+        from neurons.shared.protocols import (ChallengeProofSynapse,
+                                              ChallengeSynapse,
+                                              HeartbeatSynapse, TaskSynapse)
+        from neurons.validator.processors.commitment_processor import \
+            CommitmentProcessor
         from neurons.validator.processors.proof_processor import ProofProcessor
 
         # Setup communication processor factory
@@ -166,12 +227,18 @@ class Validator:
 
         # Two-phase challenge verification processors with verification config
         commitment_processor = CommitmentProcessor(
-            self.communicator, self.database_manager, self.verification_config
+            self.communicator,
+            self.database_manager,
+            self.verification_config,
+            config=self.config,
         )
         self.communicator.register_processor(ChallengeSynapse, commitment_processor)
 
         proof_processor = ProofProcessor(
-            self.communicator, self.database_manager, self.verification_config
+            self.communicator,
+            self.database_manager,
+            self.proof_cache,
+            self.verification_config,
         )
         self.communicator.register_processor(ChallengeProofSynapse, proof_processor)
 
@@ -218,9 +285,7 @@ class Validator:
 
                             if gpu_plugin_details:
                                 for gpu_detail in gpu_plugin_details:
-                                    gpu_uuid = gpu_detail.get("uuid") or gpu_detail.get(
-                                        "gpu_uuid"
-                                    )
+                                    gpu_uuid = gpu_detail.get("uuid")
                                     if gpu_uuid:
                                         try:
                                             # Pass complete GPU details to database
@@ -245,7 +310,7 @@ class Validator:
             )
 
             bt.logging.debug(
-                f"✅ Heartbeat processed | peer={peer_hotkey} workers={workers_processed}"
+                f"Heartbeat processed | peer={peer_hotkey} workers={workers_processed}"
             )
             return response.model_dump(), 0
 
@@ -314,12 +379,12 @@ class Validator:
                         task_data={"challenges": challenges_data},
                     )
                     bt.logging.debug(
-                        f"📋 Sent {len(pending_challenges)} challenges in batch to {peer_hotkey}"
+                        f"Sent {len(pending_challenges)} challenges in batch to {peer_hotkey}"
                     )
                 else:
                     # No tasks available
                     response = TaskResponse(task_type="no_task", task_data=None)
-                    bt.logging.debug(f"📋 No tasks available for {peer_hotkey}")
+                    bt.logging.debug(f"No tasks available for {peer_hotkey}")
 
             return response.model_dump(), 0
 
@@ -460,25 +525,31 @@ class Validator:
             return
 
         try:
-            # Initialize the database.
+
             self.database_manager.create_tables()
-            # Check for expired data after database initialization
+
+            self._cleanup_interrupted_challenges()
+
             await self._check_expired_data_on_startup()
-            # Register Axon to the network.
+
+            await self.meshhub_client.start()
+
+            await self.data_cleanup_service.start()
+
             self.axon.serve(netuid=self.netuid, subtensor=self.subtensor)
             bt.logging.info(f"🛰️ Axon served | netuid={self.netuid}")
-            # Start the Axon HTTP server.
+
             self.axon.start()
             bt.logging.info(
                 f"🛰️ Axon online | addr={self.axon.ip}:{self.axon.port} started={self.axon.started}"
             )
-            # Start the validation service.
+
             await self.validation_service.start()
-            # Start the weight manager.
+
             await self.weight_manager.start()
-            # Start the async verification service.
+
             await self.async_challenge_verifier.start()
-            # Start session cleanup task
+
             self._session_cleanup_task = asyncio.create_task(
                 self._session_cleanup_loop()
             )
@@ -499,12 +570,16 @@ class Validator:
 
     async def _graceful_shutdown(self) -> None:
         """Gracefully shutdown all validator services"""
-        # Stop services
+
         await self.async_challenge_verifier.stop()
         await self.weight_manager.stop()
         await self.validation_service.stop()
+        await self.meshhub_client.stop()
 
-        # Cancel session cleanup task
+        await self.data_cleanup_service.stop()
+
+        self.proof_cache.shutdown()
+
         if hasattr(self, "_session_cleanup_task") and self._session_cleanup_task:
             self._session_cleanup_task.cancel()
             try:
@@ -512,7 +587,6 @@ class Validator:
             except asyncio.CancelledError:
                 pass
 
-        # Stop axon server
         if hasattr(self.axon, "stop"):
             self.axon.stop()
         self.database_manager.close()
@@ -525,8 +599,15 @@ class Validator:
         try:
             await self.start()
             bt.logging.debug("Validator running | Ctrl+C to stop")
-            # Keep running until shutdown event is set
+
             await self._shutdown_event.wait()
+
+            if getattr(self, "_fatal_reason", None):
+                bt.logging.error(
+                    f"❌ Fatal shutdown requested | reason={self._fatal_reason}"
+                )
+
+                raise RuntimeError(self._fatal_reason)
         except KeyboardInterrupt:
             bt.logging.info("⏹️ Validator interrupt | stopping")
         except Exception as e:

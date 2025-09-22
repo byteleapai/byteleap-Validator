@@ -106,6 +106,35 @@ class ConfigManager:
         """Update configuration"""
         self.config.update(updates)
 
+    def merge_overrides(
+        self, overrides: Dict[str, Any], allowed_roots: List[str]
+    ) -> None:
+        """Merge in-memory overrides for a restricted set of root keys.
+
+        Only keys under allowed_roots (e.g., ["validation", "weight_management"]) are merged.
+        This does not persist to disk and preserves Fail‑Fast semantics for future get() calls.
+        """
+        if not isinstance(overrides, dict) or not overrides:
+            return
+
+        for root in allowed_roots:
+            if root in overrides and isinstance(overrides[root], dict):
+                existing = self.config.get(root, {})
+                if not isinstance(existing, dict):
+                    existing = {}
+                self.config[root] = self._deep_merge_dicts(existing, overrides[root])
+
+    def _deep_merge_dicts(
+        self, base: Dict[str, Any], updates: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        result = dict(base)
+        for k, v in updates.items():
+            if isinstance(v, dict) and isinstance(result.get(k), dict):
+                result[k] = self._deep_merge_dicts(result[k], v)
+            else:
+                result[k] = v
+        return result
+
     def get_positive_number(
         self, path: str, number_type: type = int
     ) -> Union[int, float]:

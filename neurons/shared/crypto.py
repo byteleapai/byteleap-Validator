@@ -102,7 +102,7 @@ class CryptoManager:
         )
         our_pub_b64 = base64.b64encode(our_pub_bytes).decode("ascii")
 
-        # Derive directional session keys using HKDF with enhanced binding
+        # Derive directional session keys using HKDF with explicit context binding
         k_cs, k_sc = self._derive_session_keys(
             shared_secret,
             client_nonce,
@@ -150,7 +150,7 @@ class CryptoManager:
         # Perform ECDH
         shared_secret = our_private.exchange(peer_public)
 
-        # Derive directional session keys with enhanced binding
+        # Derive directional session keys with explicit context binding
         return self._derive_session_keys(
             shared_secret,
             client_nonce,

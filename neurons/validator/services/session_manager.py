@@ -14,7 +14,8 @@ import bittensor as bt
 
 from neurons.shared.crypto import CryptoManager
 from neurons.shared.protocols import ErrorCodes
-from neurons.shared.session_replay_protection import MAX_SEQ, SlidingWindowValidator
+from neurons.shared.session_replay_protection import (MAX_SEQ,
+                                                      SlidingWindowValidator)
 
 
 class SessionState:

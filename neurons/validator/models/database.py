@@ -8,20 +8,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import bittensor as bt
-from sqlalchemy import (
-    JSON,
-    Boolean,
-    Column,
-    DateTime,
-    Float,
-    ForeignKey,
-    Index,
-    Integer,
-    String,
-    Text,
-    create_engine,
-    or_,
-)
+from sqlalchemy import (JSON, Boolean, Column, DateTime, Float, ForeignKey,
+                        Index, Integer, String, Text, create_engine, or_)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
@@ -89,6 +77,7 @@ class MinerInfo(Base):
     # Core identification
     id = Column(Integer, primary_key=True, autoincrement=True)
     hotkey = Column(String(256), unique=True, index=True, nullable=False)
+    miner_version = Column(String(32))
 
     # Network information
     public_ip = Column(String(45))
@@ -314,7 +303,6 @@ class ComputeChallenge(Base):
 
     # Phase 2 Response
     verification_targets = Column(JSON, nullable=True)
-    verification_data = Column(JSON)
     debug_info = Column(JSON, nullable=True)
 
     # Verification information
@@ -341,6 +329,42 @@ class ComputeChallenge(Base):
         Index("idx_challenge_deleted", "deleted_at"),
         Index("idx_challenge_status_created", "challenge_status", "created_at"),
         Index("idx_challenge_hotkey_status", "hotkey", "challenge_status"),
+    )
+
+
+class MeshHubTask(Base):
+    """MeshHub task cache table for validator-side persistence."""
+
+    __tablename__ = "meshhub_tasks"
+
+    # Core identification
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(64), unique=True, index=True, nullable=False)
+    worker_id = Column(String(256), index=True, nullable=True)
+    hotkey = Column(String(64), index=True, nullable=True)
+
+    # Task details
+    task_type = Column(String(32), nullable=False)
+    task_config = Column(JSON, nullable=False)
+    priority = Column(Integer, default=0)
+
+    # Task status
+    status = Column(String(20), default="pending", nullable=False)
+    sent_at = Column(DateTime, nullable=True, index=True)
+    expires_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    failure_reason = Column(Text)
+
+    # Audit fields
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    deleted_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("idx_mesh_task_worker", "worker_id"),
+        Index("idx_mesh_task_hotkey", "hotkey"),
+        Index("idx_mesh_task_status", "status"),
+        Index("idx_mesh_task_deleted", "deleted_at"),
     )
 
 
@@ -465,6 +489,68 @@ class DatabaseManager:
         """Close database connection pool"""
         if hasattr(self, "engine"):
             self.engine.dispose()
+
+    def cleanup_old_data(
+        self, session: Session, retention_days: int = 7
+    ) -> Dict[str, int]:
+        """Hard-delete old rows from event/log tables only.
+
+        Scope (created_at cutoff):
+        - network_logs, heartbeat_records, compute_challenges, meshhub_tasks, network_weights
+
+        Returns table_name -> deleted_count
+        """
+        cutoff = datetime.utcnow() - timedelta(days=retention_days)
+        deleted: Dict[str, int] = {}
+
+        # Event / history tables (no FK constraints to miner_info)
+        try:
+            deleted["network_logs"] = (
+                session.query(NetworkLog)
+                .filter(NetworkLog.created_at < cutoff)
+                .delete(synchronize_session=False)
+            )
+        except Exception:
+            deleted["network_logs"] = 0
+
+        try:
+            deleted["heartbeat_records"] = (
+                session.query(HeartbeatRecord)
+                .filter(HeartbeatRecord.created_at < cutoff)
+                .delete(synchronize_session=False)
+            )
+        except Exception:
+            deleted["heartbeat_records"] = 0
+
+        try:
+            deleted["compute_challenges"] = (
+                session.query(ComputeChallenge)
+                .filter(ComputeChallenge.created_at < cutoff)
+                .delete(synchronize_session=False)
+            )
+        except Exception:
+            deleted["compute_challenges"] = 0
+
+        try:
+            deleted["meshhub_tasks"] = (
+                session.query(MeshHubTask)
+                .filter(MeshHubTask.created_at < cutoff)
+                .delete(synchronize_session=False)
+            )
+        except Exception:
+            deleted["meshhub_tasks"] = 0
+
+        try:
+            deleted["network_weights"] = (
+                session.query(NetworkWeight)
+                .filter(NetworkWeight.created_at < cutoff)
+                .delete(synchronize_session=False)
+            )
+        except Exception:
+            deleted["network_weights"] = 0
+
+        session.commit()
+        return deleted
 
     def _get_or_create_entity(
         self,
@@ -674,10 +760,16 @@ class DatabaseManager:
 
         # Use miner_info if available, otherwise use basic heartbeat data
         miner_info = heartbeat_data.get("miner_info", {})
+        # Miner software version is provided inside miner_info as miner_version
 
         # Update miner basic information
         if miner_info:
             miner.public_ip = miner_info.get("public_ip")
+            # Update miner software version if provided by miner_info
+            if isinstance(miner_info, dict):
+                mv = miner_info.get("miner_version")
+                if mv:
+                    miner.miner_version = mv
         miner.is_online = True
         miner.last_heartbeat = datetime.utcnow()
         miner.updated_at = datetime.utcnow()
@@ -1556,3 +1648,102 @@ class DatabaseManager:
             )
             .first()
         )
+
+    # --- MeshHub integration helpers ---
+    def record_meshhub_task(
+        self,
+        session: Session,
+        task_id: str,
+        task_type: str,
+        task_config: Dict[str, Any],
+        priority: int = 0,
+        worker_id: Optional[str] = None,
+        hotkey: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        status: str = "pending",
+    ) -> MeshHubTask:
+        """Persist a MeshHub-dispatched task according to the MeshHub schema."""
+        now = datetime.utcnow()
+        entity = MeshHubTask(
+            task_id=task_id,
+            task_type=task_type,
+            task_config=task_config or {},
+            priority=priority or 0,
+            worker_id=worker_id,
+            hotkey=hotkey,
+            expires_at=expires_at,
+            status=status or "pending",
+            created_at=now,
+            updated_at=now,
+        )
+
+        session.add(entity)
+        session.commit()
+        session.refresh(entity)
+        return entity
+
+    def apply_meshhub_lease_scores(
+        self, session: Session, worker_scores: "List[Dict[str, Any]]"
+    ) -> tuple:
+        """Apply MeshHub lease score broadcast to local worker_info table.
+
+        Expects items with keys: workerKey ("<hotkey>:<worker_id>") and score (float-like).
+        Returns (updated_count, changes) where changes is a list of {workerKey, from, to} for actual modifications.
+        """
+        if not worker_scores:
+            return 0, []
+
+        updated = 0
+        changes: list = []
+        now = datetime.utcnow()
+
+        for item in worker_scores:
+            try:
+                worker_key = item.get("workerKey")
+                score_val = item.get("score")
+                if worker_key is None or score_val is None:
+                    continue
+                try:
+                    score = float(score_val)
+                except Exception:
+                    continue
+
+                if ":" not in worker_key:
+                    continue
+                hotkey, worker_id = worker_key.split(":", 1)
+
+                worker: WorkerInfo = (
+                    session.query(WorkerInfo)
+                    .filter(
+                        WorkerInfo.hotkey == hotkey,
+                        WorkerInfo.worker_id == worker_id,
+                        WorkerInfo.deleted_at.is_(None),
+                    )
+                    .first()
+                )
+                if not worker:
+                    # If worker not present yet, skip silently; it may be discovered later.
+                    continue
+
+                old = worker.lease_score if worker.lease_score is not None else 0.0
+                # Only record change if value differs meaningfully
+                if abs((score if score is not None else 0.0) - old) > 1e-12:
+                    worker.lease_score = score
+                    worker.lease_updated_at = now
+                    worker.updated_at = now
+                    updated += 1
+                    changes.append(
+                        {
+                            "workerKey": worker_key,
+                            "from": float(old),
+                            "to": float(score),
+                        }
+                    )
+            except Exception:
+                # Keep updating others even if one fails
+                continue
+
+        if updated:
+            session.commit()
+
+        return updated, changes

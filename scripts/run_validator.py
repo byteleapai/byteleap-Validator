@@ -6,6 +6,7 @@ Start and run Bittensor subnet validator
 import argparse
 import asyncio
 import logging
+import logging.handlers
 import os
 import sys
 from datetime import datetime
@@ -20,11 +21,12 @@ sys.path.insert(0, str(project_root))
 
 from neurons.shared.config.config_manager import ConfigManager
 from neurons.validator.core.validator import Validator
+from neurons.validator.services.meshhub_client import MeshHubClient
 
 
 def load_config(config_path: str) -> ConfigManager:
     """Load configuration file and return ConfigManager"""
-    bt.logging.debug(f"🧾 Load config | path={config_path}")
+    bt.logging.debug(f"Load config | path={config_path}")
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             config_data = yaml.safe_load(f)
@@ -78,6 +80,15 @@ def validate_config(config: ConfigManager) -> bool:
             bt.logging.error("❌ Config error | port must be in 1024-65535")
             return False
 
+        # Validate database cleanup retention
+        try:
+            config.get_positive_number("database.event_retention_days", int)
+        except (KeyError, ValueError) as e:
+            bt.logging.error(
+                f"❌ Config error | database.event_retention_days invalid | error={e}"
+            )
+            return False
+
         # Validate critical GPU verification parameters
         try:
             config.get("validation.gpu.verification.coordinate_sample_count")
@@ -121,6 +132,13 @@ def validate_config(config: ConfigManager) -> bool:
         except KeyError as e:
             bt.logging.warning(f"⚠️ Verify params | skip_check err={e}")
 
+        # MeshHub required configuration
+        try:
+            MeshHubClient.validate_config(config)
+        except (KeyError, ValueError) as e:
+            bt.logging.error(f"❌ MeshHub config invalid | error={e}")
+            return False
+
         return True
 
     except KeyError as e:
@@ -146,16 +164,24 @@ def setup_logging(config: ConfigManager) -> None:
     # Create log directory
     os.makedirs(log_dir, exist_ok=True)
 
-    # Create log filename with current date
-    current_date = datetime.now().strftime("%Y%m%d")
-    log_filename = f"validator_{current_date}.log"
-    log_filepath = Path(log_dir) / log_filename
-
     # Get the root logger used by bittensor
     root_logger = logging.getLogger()
 
-    # Create file handler
-    file_handler = logging.FileHandler(log_filepath, encoding="utf-8")
+    # Create rotating file handler (daily rotation, keep 30 days)
+    log_filename = "validator.log"
+    log_filepath = Path(log_dir) / log_filename
+
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        filename=log_filepath,
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
+        utc=False,
+    )
+
+    # Set suffix for rotated files (YYYYMMDD format)
+    file_handler.suffix = "%Y%m%d"
 
     # Create formatter
     formatter = logging.Formatter(
@@ -181,7 +207,7 @@ def setup_logging(config: ConfigManager) -> None:
     websockets_logger = logging.getLogger("websockets")
     websockets_logger.setLevel(logging.WARNING)
 
-    bt.logging.debug(f"🧾 File logging | path={log_filepath}")
+    bt.logging.info(f"🧾 File logging | path={log_filepath} | level={log_level}")
 
 
 def setup_environment(config: ConfigManager) -> None:
@@ -236,7 +262,7 @@ async def main():
     setup_environment(config)
 
     # Display configuration information
-    bt.logging.info(f"🌐 Net | id={config.get('netuid')}")
+    bt.logging.info(f"🌐 Netuid | id={config.get('netuid')}")
     bt.logging.info(f"🔌 Port | port={config.get('port')}")
     bt.logging.info(f"👛 Wallet | name={config.get('wallet.name')}")
     bt.logging.info(f"🔑 Hotkey | name={config.get('wallet.hotkey')}")

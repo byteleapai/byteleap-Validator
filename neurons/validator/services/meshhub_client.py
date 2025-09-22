@@ -1,0 +1,1069 @@
+"""
+MeshHub WebSocket Client
+Establishes an authenticated, encrypted session with MeshHub and processes inbound messages.
+
+Scope:
+- Handshake using hotkey + access token
+- Lease score broadcast -> apply to local DB
+- Config update -> in-memory merge (validation, weight_management)
+- Task publish -> persist to meshhub_tasks and ACK
+
+Notes:
+- Encryption uses CryptoManager with deterministic IV and AAD binding
+- Auto-reconnect with fixed delay from config
+"""
+
+import asyncio
+import base64
+import json
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+import bittensor as bt
+
+from neurons.shared.config.config_manager import ConfigManager
+from neurons.shared.crypto import CryptoManager
+from neurons.validator.models.database import DatabaseManager
+
+
+@dataclass
+class _SessionState:
+    session_id: str
+    k_cs: bytes
+    k_sc: bytes
+    server_hotkey: str
+    seq_out: int = 0
+
+
+class MeshHubClient:
+    """WebSocket client for MeshHub with session encryption."""
+
+    @staticmethod
+    def validate_config(config: ConfigManager) -> None:
+        """Validate MeshHub-related configuration (fail-fast).
+
+        Raises KeyError/ValueError on invalid config. Intended to be the single
+        source of truth for MeshHub config validation and reusable by startup.
+        """
+
+        ws_url = config.get_non_empty_string("meshhub.ws_url")
+        access_token = config.get_non_empty_string("meshhub.access_token")
+
+        caps = config.get_list("meshhub.capabilities", min_length=1)
+        if not all(isinstance(c, str) and c.strip() for c in caps):
+            bt.logging.error(
+                "❌ Config error | meshhub.capabilities must be non-empty strings"
+            )
+            raise ValueError("meshhub.capabilities must be non-empty strings")
+
+        reconnect_delay = config.get_positive_number(
+            "meshhub.reconnect_delay_seconds", int
+        )
+        if reconnect_delay < 1:
+            bt.logging.error(
+                "❌ Config error | meshhub.reconnect_delay_seconds must be >= 1"
+            )
+            raise ValueError("meshhub.reconnect_delay_seconds must be >= 1")
+
+        hb_interval = config.get_positive_number(
+            "meshhub.heartbeat_interval_seconds", int
+        )
+        if hb_interval < 1:
+            bt.logging.error(
+                "❌ Config error | meshhub.heartbeat_interval_seconds must be >= 1"
+            )
+            raise ValueError("meshhub.heartbeat_interval_seconds must be >= 1")
+
+        res_interval = config.get_positive_number(
+            "meshhub.resource_report_interval_seconds", int
+        )
+        if res_interval < 5:
+            bt.logging.error(
+                "❌ Config error | meshhub.resource_report_interval_seconds must be >= 5"
+            )
+            raise ValueError("meshhub.resource_report_interval_seconds must be >= 5")
+
+    def __init__(
+        self,
+        wallet: bt.wallet,
+        config: ConfigManager,
+        db_manager: DatabaseManager,
+        on_fatal: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.wallet = wallet
+        self.config = config
+        self.db = db_manager
+
+        self.ws_url = self.config.get("meshhub.ws_url")
+        self.access_token = self.config.get("meshhub.access_token")
+        self.capabilities = self.config.get("meshhub.capabilities")
+        self.reconnect_delay = int(self.config.get("meshhub.reconnect_delay_seconds"))
+        self.heartbeat_interval = int(
+            self.config.get("meshhub.heartbeat_interval_seconds")
+        )
+        self.resource_report_interval = int(
+            self.config.get("meshhub.resource_report_interval_seconds")
+        )
+
+        self.crypto = CryptoManager(self.wallet)
+        self.session: Optional[_SessionState] = None
+        self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+        self._hb_task: Optional[asyncio.Task] = None
+        self._rs_task: Optional[asyncio.Task] = None
+
+        self._ws = None
+        self._ws_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._start_time_ms = int(asyncio.get_event_loop().time() * 1000)
+        # Wall-clock startup time (UTC, naive) for DB window filtering
+        try:
+            self._start_time_utc = datetime.utcnow()
+        except Exception:
+            self._start_time_utc = None
+        # Client version from version.txt at repository root
+        self._client_version = self._load_client_version()
+        self._on_fatal = on_fatal
+        # No outbound error correlation state (handled by MeshHub)
+
+    def _now_ms(self) -> int:
+        """Wall-clock epoch milliseconds in UTC."""
+        return int(time.time() * 1000)
+
+    def _utc_now_iso(self) -> str:
+        """UTC timestamp in ISO-8601 with 'Z' suffix (UTC)."""
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _to_iso_utc(self, dt: Optional[datetime]) -> Optional[str]:
+        """Convert datetime to UTC ISO-8601 string with 'Z' offset (Instant-compatible)."""
+        if not dt:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt.isoformat()
+
+    async def start_blocking_initial(self) -> None:
+        """Perform a blocking connect+handshake; exit on missing token or auth failure."""
+        token = (self.access_token or "").strip()
+        if not token:
+            bt.logging.error("❌ MeshHub token missing; abort startup")
+            raise SystemExit(1)
+        await self._connect_once_blocking()
+
+        await self.start()
+
+    async def start(self) -> None:
+        if self._task and not self._task.done():
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run_loop())
+        self._hb_task = asyncio.create_task(self._heartbeat_loop())
+        self._rs_task = asyncio.create_task(self._resource_report_loop())
+        bt.logging.info(f"🕸️ MeshHub client started | url={self.ws_url}")
+
+    async def stop(self) -> None:
+        """Stop client quickly and unblock any pending websocket recv."""
+        self._stop.set()
+
+        for t in (self._hb_task, self._rs_task):
+            if t:
+                t.cancel()
+        for t in (self._hb_task, self._rs_task):
+            if t:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+
+        try:
+            async with self._ws_lock:
+                ws = self._ws
+                self._ws = None
+            if ws is not None:
+                try:
+                    await asyncio.wait_for(ws.close(), timeout=2.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if self._task and not self._task.done():
+            try:
+                await asyncio.wait_for(self._task, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                try:
+                    self._task.cancel()
+                    await self._task
+                except Exception:
+                    pass
+
+        bt.logging.info("🕸️ MeshHub client stopped")
+
+    async def _run_loop(self) -> None:
+        import websockets
+
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(
+                    self.ws_url, max_size=10 * 1024 * 1024
+                ) as ws:
+                    async with self._ws_lock:
+                        self._ws = ws
+                    await self._handshake(ws)
+                    await self._recv_loop(ws)
+            except Exception as e:
+                bt.logging.error(f"❌ MeshHub connection error | error={e}")
+            finally:
+                async with self._ws_lock:
+                    self._ws = None
+
+            if self._stop.is_set():
+                break
+            await asyncio.sleep(self.reconnect_delay)
+
+    async def _connect_once_blocking(self) -> None:
+        import websockets
+
+        try:
+            async with websockets.connect(self.ws_url, max_size=10 * 1024 * 1024) as ws:
+                await self._handshake(ws)
+        except SystemExit:
+            raise
+        except Exception as e:
+            bt.logging.error(f"❌ MeshHub initial connect failed | error={e}")
+            raise SystemExit(1)
+
+    async def _handshake(self, ws) -> None:
+
+        client_pub_b64, client_priv_bytes = self.crypto.begin_handshake()
+        client_nonce = self.crypto.generate_nonce()
+        client_nonce_b64 = base64.b64encode(client_nonce).decode("ascii")
+
+        payload = {
+            "validatorHotkey": self.wallet.hotkey.ss58_address,
+            "accessToken": self.access_token,
+            # Project version sourced from version.txt at repo root
+            "clientVersion": self._client_version,
+            "capabilities": list(self.capabilities or []),
+            "clientPublicKey": client_pub_b64,
+            "clientNonce": client_nonce_b64,
+        }
+        message = {
+            "type": "MESH_SESSION_INIT_V1",
+            "timestamp": self._now_ms(),
+            "data": payload,
+        }
+
+        await ws.send(json.dumps(message))
+        bt.logging.debug("MeshHub handshake sent")
+
+        raw = await ws.recv()
+        ack = json.loads(raw)
+        if ack.get("type") == "MESH_ERROR_V1":
+            code = (ack.get("data") or {}).get("code")
+            # if code == 4001:
+            #     bt.logging.error("❌ MeshHub auth failed | code=4001 invalid_token")
+            #     if self._on_fatal:
+            #         self._on_fatal("meshhub_auth_invalid")
+            #     raise RuntimeError("meshhub_auth_invalid")
+            raise RuntimeError(f"MeshHub error during handshake: code={code}")
+        if ack.get("type") != "MESH_SESSION_INIT_RESPONSE_V1":
+            raise RuntimeError("MeshHub handshake failed: unexpected response type")
+
+        data = ack.get("data") or {}
+        session_id = data.get("sessionId")
+        server_pub_b64 = data.get("validatorEphemeralPublicKey")
+        server_nonce_b64 = data.get("serverNonce")
+        server_hotkey = data.get("serverHotkey")
+
+        if not (session_id and server_pub_b64 and server_nonce_b64 and server_hotkey):
+            raise RuntimeError("MeshHub handshake failed: missing fields")
+
+        server_nonce = base64.b64decode(server_nonce_b64.encode("ascii"))
+
+        k_cs, k_sc = self.crypto.complete_handshake(
+            our_private_key_bytes=client_priv_bytes,
+            our_eph_pub_b64=client_pub_b64,
+            peer_eph_pub_b64=server_pub_b64,
+            client_nonce=client_nonce,
+            server_nonce=server_nonce,
+            peer_hotkey=server_hotkey,
+        )
+
+        self.session = _SessionState(
+            session_id=session_id,
+            k_cs=k_cs,
+            k_sc=k_sc,
+            server_hotkey=server_hotkey,
+            seq_out=0,
+        )
+        bt.logging.info(f"🔐 MeshHub session established | id={session_id}")
+
+    async def _recv_loop(self, ws) -> None:
+        while not self._stop.is_set():
+            try:
+                raw = await ws.recv()
+            except asyncio.CancelledError:
+                return
+            msg = json.loads(raw)
+            msg_type = msg.get("type")
+
+            if msg_type == "MESH_ERROR_V1":
+                data = msg.get("data") or {}
+                code = data.get("code")
+                if code in (4002, 4011, 4020):
+                    bt.logging.warning("⚠️ Session expired; re-handshake")
+                    self.session = None
+                    raise RuntimeError("session_expired")
+                if code == 4001:
+                    # Authentication invalid; do not exit, trigger reconnect
+                    bt.logging.error("❌ MeshHub auth invalid during session; retrying")
+                    self.session = None
+                    raise RuntimeError("meshhub_auth_invalid")
+                bt.logging.warning(f"⚠️ MeshHub error | code={code}")
+                continue
+            if msg_type in ("MESH_SESSION_INIT_V1", "MESH_SESSION_INIT_RESPONSE_V1"):
+                bt.logging.debug(f"MeshHub control message | type={msg_type}")
+                continue
+
+            decrypted = self._decrypt_inbound(msg)
+            if not decrypted:
+                continue
+            dtype = msg_type
+            data = decrypted
+
+            if dtype == "MESH_LEASE_PUBLISH_V1":
+                await self._handle_lease_publish(data)
+            elif dtype == "MESH_CONFIG_UPDATE_V1":
+                await self._handle_config_update(ws, msg, data)
+            elif dtype == "MESH_TASK_PUBLISH_V1":
+                await self._handle_task_publish(ws, msg, data)
+            else:
+                bt.logging.debug(f"MeshHub unknown type | type={dtype}")
+
+    def _decrypt_inbound(self, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.session:
+            return None
+        payload = msg.get("encrypted")
+        if not payload:
+            bt.logging.error("❌ Encrypted payload missing for MeshHub message")
+            return None
+
+        package = {
+            "ver": payload.get("version"),
+            "session_id": payload.get("sessionId"),
+            "seq": payload.get("sequence"),
+            "ciphertext": payload.get("ciphertext"),
+            "sender": payload.get("sender"),
+            "recipient": payload.get("recipient"),
+            "synapse_type": payload.get("messageType"),
+        }
+        try:
+            plain, session_id, seq = self.crypto.decrypt_with_session(
+                json.dumps(package),
+                session_key=self.session.k_sc,
+                expected_sender=self.session.server_hotkey,
+                expected_recipient=self.wallet.hotkey.ss58_address,
+                synapse_type=payload.get("messageType"),
+            )
+            return plain if isinstance(plain, dict) else {}
+        except Exception as e:
+            bt.logging.error(f"❌ MeshHub decrypt error | error={e}")
+            return None
+
+    async def _handle_lease_publish(self, data: Dict[str, Any]) -> None:
+        scores = data.get("workerScores") or []
+        try:
+            with self.db.get_session() as session:
+                updated, changes = self.db.apply_meshhub_lease_scores(session, scores)
+
+                if changes:
+
+                    def _fmt(v: Any) -> str:
+                        try:
+                            return f"{float(v):.4f}"
+                        except Exception:
+                            return str(v)
+
+                    change_str = ",".join(
+                        f"{c.get('workerKey')} {_fmt(c.get('from'))}->{_fmt(c.get('to'))}"
+                        for c in changes
+                    )
+                    bt.logging.info(
+                        f"📊 Lease sync | updated={updated} changes=[{change_str}]"
+                    )
+                else:
+                    bt.logging.info(f"📊 Lease sync | updated={updated}")
+        except Exception as e:
+            bt.logging.error(f"❌ Lease sync failed | error={e}")
+
+    async def _handle_config_update(
+        self, ws, msg: Dict[str, Any], data: Dict[str, Any]
+    ) -> None:
+
+        raw_payload = data.get("payload") or {}
+        allowed_roots = ["validation", "weight_management"]
+
+        if isinstance(raw_payload, dict) and any(
+            r in raw_payload for r in allowed_roots
+        ):
+            overrides = raw_payload
+        else:
+            overrides = {}
+
+        if not overrides:
+            provided_keys = (
+                list(raw_payload.keys()) if isinstance(raw_payload, dict) else []
+            )
+            bt.logging.error(
+                f"❌ Config merge failed | reason=no_allowed_root allowed=validation,weight_management provided={provided_keys}"
+            )
+            ack_id = msg.get("messageId")
+            if ack_id:
+                await self._send_ack(
+                    ws,
+                    message_id=ack_id,
+                    message_type="MESH_CONFIG_UPDATE_V1",
+                    status="failed",
+                    metadata={
+                        "error": "no_allowed_root",
+                        "allowed": ["validation", "weight_management"],
+                        "provided_keys": provided_keys,
+                    },
+                )
+            return
+        try:
+
+            roots = allowed_roots
+            old_snapshots: Dict[str, Any] = {}
+            for r in roots:
+                try:
+                    val = self.config.get(r)
+                    old_snapshots[r] = (
+                        json.loads(json.dumps(val)) if isinstance(val, dict) else val
+                    )
+                except Exception:
+                    old_snapshots[r] = {}
+
+            self.config.merge_overrides(overrides, roots)
+
+            def diff_subset(old: Any, new: Any, subset: Any) -> Any:
+                if not isinstance(subset, dict):
+
+                    return new if old != new else None
+                result: Dict[str, Any] = {}
+                for k, sub in subset.items():
+                    old_v = old.get(k) if isinstance(old, dict) else None
+                    new_v = new.get(k) if isinstance(new, dict) else None
+                    if isinstance(sub, dict):
+                        child = diff_subset(
+                            old_v if isinstance(old_v, dict) else {},
+                            new_v if isinstance(new_v, dict) else {},
+                            sub,
+                        )
+                        if child not in (None, {}, []):
+                            result[k] = child
+                    else:
+                        if old_v != new_v:
+                            result[k] = new_v
+                return result
+
+            diffs: Dict[str, Any] = {}
+            if isinstance(overrides, dict):
+                for r in roots:
+                    if r in overrides:
+                        try:
+                            new_val = self.config.get(r)
+                        except Exception:
+                            new_val = {}
+                        subset_src = overrides.get(r) or {}
+                        diff_r = diff_subset(
+                            old_snapshots.get(r, {}),
+                            new_val if isinstance(new_val, dict) else {},
+                            subset_src,
+                        )
+                        if diff_r not in (None, {}, []):
+                            diffs[r] = diff_r
+
+            try:
+                updates_json = json.dumps(
+                    diffs, ensure_ascii=False, separators=(",", ":")
+                )
+            except Exception:
+                updates_json = str(diffs)
+            bt.logging.info(f"⚙️ Config merged | updates={updates_json}")
+            ack_id = msg.get("messageId")
+            if ack_id:
+                await self._send_ack(
+                    ws,
+                    message_id=ack_id,
+                    message_type="MESH_CONFIG_UPDATE_V1",
+                    status="accepted",
+                )
+        except Exception as e:
+            bt.logging.error(f"❌ Config merge failed | error={e}")
+            ack_id = msg.get("messageId")
+            if ack_id:
+                await self._send_ack(
+                    ws,
+                    message_id=ack_id,
+                    message_type="MESH_CONFIG_UPDATE_V1",
+                    status="failed",
+                    metadata={"error": str(e)},
+                )
+
+    async def _handle_task_publish(
+        self, ws, msg: Dict[str, Any], data: Dict[str, Any]
+    ) -> None:
+
+        task_key = data.get("taskKey")
+        worker_key = data.get("workerKey")
+        task_type = (data.get("taskType") or "vm_creation").strip()
+        task_payload = data.get("payload") or {}
+        priority = int(data.get("priority") or 0)
+        ttl_ms = data.get("ttl")
+
+        hotkey = None
+        worker_id = None
+        if isinstance(worker_key, str) and ":" in worker_key:
+            hotkey, worker_id = worker_key.split(":", 1)
+
+        expires_at = None
+        if ttl_ms and isinstance(ttl_ms, int) and ttl_ms > 0:
+            from datetime import datetime, timedelta
+
+            expires_at = datetime.utcnow() + timedelta(milliseconds=ttl_ms)
+
+        if not task_key:
+            bt.logging.error("❌ Mesh task missing taskKey; ignored")
+            return
+
+        try:
+            with self.db.get_session() as session:
+                self.db.record_meshhub_task(
+                    session=session,
+                    task_id=task_key,
+                    task_type=task_type,
+                    task_config=task_payload,
+                    priority=priority,
+                    worker_id=worker_id,
+                    hotkey=hotkey,
+                    expires_at=expires_at,
+                    status="pending",
+                )
+            bt.logging.info(f"🧾 Mesh task stored | id={task_key} type={task_type}")
+        except Exception as e:
+            bt.logging.error(f"❌ Store mesh task failed | id={task_key} error={e}")
+
+        ack_id = msg.get("messageId")
+        if ack_id:
+            await self._send_ack(
+                ws,
+                message_id=ack_id,
+                message_type="MESH_TASK_PUBLISH_V1",
+                status="accepted",
+            )
+
+    async def _send_ack(
+        self,
+        ws,
+        message_id: str,
+        message_type: str,
+        status: str = "accepted",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        ack = {
+            "messageId": message_id,
+            "messageType": message_type,
+            "status": status,
+            "metadata": metadata or {},
+        }
+        await self._send_encrypted(ws, "MESH_ACK_V1", ack)
+
+    async def _send_encrypted(self, ws, msg_type: str, data: Dict[str, Any]) -> None:
+        if not self.session:
+            return
+
+        try:
+            async with self._send_lock:
+                self.session.seq_out += 1
+                package_json = self.crypto.encrypt_with_session(
+                    plaintext=data,
+                    session_id=self.session.session_id,
+                    session_key=self.session.k_cs,
+                    seq=self.session.seq_out,
+                    sender_hotkey=self.wallet.hotkey.ss58_address,
+                    recipient_hotkey=self.session.server_hotkey,
+                    synapse_type=msg_type,
+                )
+                package = json.loads(package_json)
+                encrypted_payload = {
+                    "version": package.get("ver"),
+                    "sessionId": package.get("session_id"),
+                    "sequence": package.get("seq"),
+                    "ciphertext": package.get("ciphertext"),
+                    "sender": package.get("sender"),
+                    "recipient": package.get("recipient"),
+                    "messageType": package.get("synapse_type"),
+                }
+
+            message = {
+                "type": msg_type,
+                "timestamp": self._now_ms(),
+                "encrypted": encrypted_payload,
+            }
+            await ws.send(json.dumps(message))
+        except Exception as e:
+            bt.logging.error(
+                f"❌ MeshHub encrypt/send failed | type={msg_type} error={e}"
+            )
+
+    async def _send_encrypted_ws(self, msg_type: str, data: Dict[str, Any]) -> None:
+        async with self._ws_lock:
+            ws = self._ws
+        if ws is None:
+            return
+        await self._send_encrypted(ws, msg_type, data)
+
+    async def _heartbeat_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.session:
+                    payload = self._build_heartbeat_payload()
+                    await self._send_encrypted_ws("MESH_HEARTBEAT_V1", payload)
+            except Exception:
+                pass
+            await asyncio.sleep(max(1, self.heartbeat_interval))
+
+    async def _resource_report_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.session:
+                    payload = self._build_resource_snapshot()
+                    await self._send_encrypted_ws("MESH_RESOURCE_REPORT_V1", payload)
+            except Exception:
+                pass
+            await asyncio.sleep(max(5, self.resource_report_interval))
+
+    def _build_heartbeat_payload(self) -> Dict[str, Any]:
+        now_ms = int(asyncio.get_event_loop().time() * 1000)
+        uptime_ms = max(0, now_ms - self._start_time_ms)
+
+        active_miners = 0
+        active_workers = 0
+        total_tasks = 0
+        success_tasks = 0
+
+        try:
+            from neurons.validator.models.database import (MeshHubTask,
+                                                           MinerInfo,
+                                                           WorkerInfo)
+
+            with self.db.get_session() as session:
+                # Online miners and workers (soft-delete aware)
+                active_miners = (
+                    session.query(MinerInfo)
+                    .filter(
+                        MinerInfo.is_online.is_(True), MinerInfo.deleted_at.is_(None)
+                    )
+                    .count()
+                )
+                active_workers = (
+                    session.query(WorkerInfo)
+                    .filter(
+                        WorkerInfo.is_online.is_(True), WorkerInfo.deleted_at.is_(None)
+                    )
+                    .count()
+                )
+
+                # Task window since process startup (fallback to all-time on missing startup time)
+                q_total = session.query(MeshHubTask).filter(
+                    MeshHubTask.deleted_at.is_(None)
+                )
+                q_success = session.query(MeshHubTask).filter(
+                    MeshHubTask.deleted_at.is_(None)
+                )
+                if self._start_time_utc is not None:
+                    q_total = q_total.filter(
+                        MeshHubTask.created_at >= self._start_time_utc
+                    )
+                    q_success = q_success.filter(
+                        MeshHubTask.created_at >= self._start_time_utc
+                    )
+                # Success criteria: status in {completed, success}
+                q_success = q_success.filter(
+                    MeshHubTask.status.in_(["completed", "success"])
+                )
+
+                total_tasks = q_total.count()
+                success_tasks = q_success.count()
+        except Exception:
+            # Keep heartbeat resilient to DB issues
+            pass
+
+        success_rate = (
+            1.0 if total_tasks == 0 else float(success_tasks) / float(total_tasks)
+        )
+
+        stats = {
+            "uptime": uptime_ms,
+            "activeWorkers": int(active_workers),
+            "activeMiners": int(active_miners),
+            "totalTasks": int(total_tasks),
+            "successRate": float(success_rate),
+        }
+
+        return {
+            # Use project version (same as handshake)
+            "version": self._client_version,
+            "statistics": stats,
+        }
+
+    def _build_resource_snapshot(self) -> Dict[str, Any]:
+        try:
+            from neurons.validator.models.database import (GPUInventory,
+                                                           HardwareInfo,
+                                                           HeartbeatRecord,
+                                                           MinerInfo,
+                                                           WorkerInfo)
+
+            miners: List[Dict[str, Any]] = []
+            with self.db.get_session() as session:
+                miner_rows = (
+                    session.query(MinerInfo)
+                    .filter(MinerInfo.deleted_at.is_(None))
+                    .all()
+                )
+                for m in miner_rows:
+                    workers = (
+                        session.query(WorkerInfo)
+                        .filter(
+                            WorkerInfo.hotkey == m.hotkey,
+                            WorkerInfo.deleted_at.is_(None),
+                        )
+                        .all()
+                    )
+                    worker_list: List[Dict[str, Any]] = []
+                    for w in workers:
+                        hw = (
+                            session.query(HardwareInfo)
+                            .filter(
+                                HardwareInfo.hotkey == w.hotkey,
+                                HardwareInfo.worker_id == w.worker_id,
+                                HardwareInfo.deleted_at.is_(None),
+                            )
+                            .first()
+                        )
+                        gpus = (
+                            session.query(GPUInventory)
+                            .filter(
+                                GPUInventory.hotkey == w.hotkey,
+                                GPUInventory.worker_id == w.worker_id,
+                                GPUInventory.deleted_at.is_(None),
+                            )
+                            .all()
+                        )
+                        # Full hardware info mapping required by MeshHub integration
+                        gpu_list = [g.gpu_info for g in gpus if g.gpu_info is not None]
+                        hardware = {
+                            "cpu": (
+                                hw.cpu_info if hw and hw.cpu_info is not None else {}
+                            ),
+                            "memory": (
+                                hw.memory_info
+                                if hw and hw.memory_info is not None
+                                else {}
+                            ),
+                            "storage": (
+                                hw.storage_info
+                                if hw and hw.storage_info is not None
+                                else []
+                            ),
+                            "gpus": gpu_list,
+                            "mb_info": (
+                                hw.motherboard_info
+                                if hw and hw.motherboard_info is not None
+                                else {}
+                            ),
+                        }
+                        # Latest utilization stats from the most recent heartbeat record
+                        avg_cpu = None
+                        avg_mem = None
+                        try:
+                            last_hb = (
+                                session.query(HeartbeatRecord)
+                                .filter(
+                                    HeartbeatRecord.hotkey == w.hotkey,
+                                    HeartbeatRecord.worker_id == w.worker_id,
+                                    HeartbeatRecord.deleted_at.is_(None),
+                                )
+                                .order_by(HeartbeatRecord.created_at.desc())
+                                .first()
+                            )
+                            if last_hb is not None:
+                                avg_cpu = (
+                                    float(last_hb.cpu_usage)
+                                    if last_hb.cpu_usage is not None
+                                    else None
+                                )
+                                avg_mem = (
+                                    float(last_hb.memory_usage)
+                                    if last_hb.memory_usage is not None
+                                    else None
+                                )
+                        except Exception:
+                            pass
+
+                        worker_list.append(
+                            {
+                                "workerKey": f"{w.hotkey}:{w.worker_id}",
+                                "workerId": w.worker_id,
+                                # MeshHub expects uppercase enums: ACTIVE|INACTIVE|BUSY|MAINTENANCE|OFFLINE|UNKNOWN
+                                "status": "ACTIVE" if w.is_online else "OFFLINE",
+                                # Preserve actual worker version if available
+                                "version": w.worker_version or None,
+                                "capabilities": w.capabilities or [],
+                                "leaseScore": w.lease_score or 0.0,
+                                "lastSeenAt": self._to_iso_utc(w.last_heartbeat),
+                                "hardware": hardware,
+                                # Average utilization stats (rolling averages from hardware table)
+                                "stats": {
+                                    "avg_cpu_usage": avg_cpu,
+                                    "avg_memory_usage": avg_mem,
+                                    "avg_storage_usage": None,
+                                },
+                                "uptimeSeconds": (
+                                    int(hw.uptime_seconds)
+                                    if hw and hw.uptime_seconds
+                                    else None
+                                ),
+                                # Network details not reported for now
+                                "network": {},
+                                # OS/system info as reported by worker
+                                "os_info": (
+                                    hw.system_info
+                                    if hw and hw.system_info is not None
+                                    else {}
+                                ),
+                            }
+                        )
+
+                    miners.append(
+                        {
+                            "hotkey": m.hotkey,
+                            # MeshHub expects uppercase enums: ACTIVE|INACTIVE|UNKNOWN|OFFLINE
+                            "status": "ACTIVE" if m.is_online else "OFFLINE",
+                            # Report miner software version if recorded
+                            "version": m.miner_version or None,
+                            "workers": worker_list,
+                        }
+                    )
+            return {"miners": miners}
+        except Exception:
+            return {"miners": []}
+
+    def _load_client_version(self) -> str:
+        """Load project version from version.txt at repository root."""
+        try:
+            root = Path(__file__).resolve().parents[3]
+            version_path = root / "version.txt"
+            text = version_path.read_text(encoding="utf-8").strip()
+            return text if text else "unknown"
+        except Exception:
+            return "unknown"
+
+    def _build_score_report(
+        self, effective_at_iso: Optional[str] = None
+    ) -> Dict[str, Any]:
+        try:
+            from datetime import datetime, timedelta
+
+            from neurons.validator.models.database import (HeartbeatRecord,
+                                                           MinerInfo,
+                                                           WorkerInfo)
+            from neurons.validator.services.worker_performance_ranker import \
+                WorkerPerformanceRanker
+
+            window_min = int(self.config.get("validation.ranking_window_minutes"))
+            challenge_interval = int(self.config.get("validation.challenge_interval"))
+            pr_threshold = float(
+                self.config.get("validation.participation_rate_threshold")
+            )
+            lease_w = float(
+                self.config.get("weight_management.score_weights.lease_weight")
+            )
+            chall_w = float(
+                self.config.get("weight_management.score_weights.challenge_weight")
+            )
+
+            ranker = WorkerPerformanceRanker(self.db, challenge_interval, pr_threshold)
+            ranked_workers = ranker.calculate_global_worker_rankings(window_min)
+            miner_challenge_raw = ranker.calculate_miner_challenge_scores(
+                ranked_workers
+            )
+            max_raw = max(miner_challenge_raw.values()) if miner_challenge_raw else 0.0
+            total_ranked = len(ranked_workers)
+
+            def _miner_lease_score(session, hotkey: str) -> float:
+
+                workers = (
+                    session.query(WorkerInfo)
+                    .filter(
+                        WorkerInfo.hotkey == hotkey,
+                        WorkerInfo.deleted_at.is_(None),
+                    )
+                    .all()
+                )
+                if not workers:
+                    return 0.0
+                total = sum(w.lease_score or 0.0 for w in workers)
+                max_workers = min(100, len(workers))
+                return min(1.0, (total / max_workers) if max_workers > 0 else 0.0)
+
+            def _availability_score(session, hotkey: str) -> float:
+
+                window_start = datetime.utcnow() - timedelta(hours=169)
+                records = (
+                    session.query(HeartbeatRecord)
+                    .filter(
+                        HeartbeatRecord.hotkey == hotkey,
+                        HeartbeatRecord.created_at >= window_start,
+                    )
+                    .order_by(HeartbeatRecord.created_at.asc())
+                    .all()
+                )
+                if not records:
+                    return 0.0
+                expected = 169 * 12
+                intervals = set(int(r.created_at.timestamp() // 300) for r in records)
+                return min(1.0, len(intervals) / expected) if expected > 0 else 0.0
+
+            worker_scores: List[Dict[str, Any]] = []
+
+            with self.db.get_session() as session:
+                miners = (
+                    session.query(MinerInfo)
+                    .filter(MinerInfo.deleted_at.is_(None))
+                    .all()
+                )
+
+                for m in miners:
+                    workers = (
+                        session.query(WorkerInfo)
+                        .filter(
+                            WorkerInfo.hotkey == m.hotkey,
+                            WorkerInfo.deleted_at.is_(None),
+                        )
+                        .all()
+                    )
+
+                    for w in workers:
+                        wk_key = f"{w.hotkey}_{w.worker_id}"
+                        ws = ranked_workers.get(wk_key)
+
+                        is_leased = (w.lease_score or 0.0) > 0.0
+                        perf_score = (
+                            1.0
+                            if is_leased
+                            else ((ws.performance_score if ws else 0.0))
+                        )
+                        rank = (ws.global_rank + 1) if ws else None
+                        factors = {
+                            "windowMinutes": window_min,
+                            "leaseScore": float(w.lease_score or 0.0),
+                            "isLeased": is_leased,
+                            "avgExecMs": float(
+                                (
+                                    ws.execution_time_ms
+                                    if ws
+                                    else (w.avg_task_time_ms or 0.0)
+                                )
+                                or 0.0
+                            ),
+                            "successRate": float(ws.success_rate if ws else 0.0),
+                            "participationScore": float(
+                                ws.participation_score if ws else 0.0
+                            ),
+                            "actualParticipation": int(
+                                ws.actual_participation if ws else 0
+                            ),
+                            "baselineExpected": float(
+                                ((window_min * 60) / challenge_interval) * pr_threshold
+                            ),
+                            "rank": int(rank) if rank is not None else None,
+                            "rankTotal": total_ranked,
+                            "performanceScore": float(perf_score),
+                        }
+                        worker_scores.append(
+                            {
+                                "workerKey": f"{w.hotkey}:{w.worker_id}",
+                                "score": round(perf_score, 4),
+                                "factors": factors,
+                                "timestamp": self._utc_now_iso(),
+                            }
+                        )
+
+                    lease_score = _miner_lease_score(session, m.hotkey)
+                    raw_challenge = float(miner_challenge_raw.get(m.hotkey, 0.0))
+                    challenge_norm = (
+                        min(1.0, raw_challenge / max_raw) if max_raw > 0 else 0.0
+                    )
+                    availability = _availability_score(session, m.hotkey)
+                    composite = lease_score * lease_w + challenge_norm * chall_w
+                    final_score = composite * availability
+
+                    leased_count = sum(
+                        1 for w in workers if (w.lease_score or 0.0) > 0.0
+                    )
+                    unleased_count = max(0, len(workers) - leased_count)
+                    miner_factors = {
+                        "windowMinutes": window_min,
+                        "leaseWeight": lease_w,
+                        "challengeWeight": chall_w,
+                        "leaseScore": float(lease_score),
+                        "challengeRaw": float(raw_challenge),
+                        "challengeNorm": float(challenge_norm),
+                        "availabilityScore": float(availability),
+                        "compositeScore": float(composite),
+                        "minerWorkerCount": len(workers),
+                        "leasedWorkerCount": leased_count,
+                        "unleasedWorkerCount": unleased_count,
+                        "rankedWorkerCount": total_ranked,
+                    }
+                    worker_scores.append(
+                        {
+                            "workerKey": f"{m.hotkey}:-1",
+                            "score": round(final_score, 4),
+                            "factors": miner_factors,
+                            "timestamp": self._utc_now_iso(),
+                        }
+                    )
+
+            payload: Dict[str, Any] = {
+                "workerScores": worker_scores,
+                "timestamp": self._utc_now_iso(),
+                "version": "1.0",
+            }
+            if effective_at_iso:
+                payload["effectiveAt"] = effective_at_iso
+            return payload
+        except Exception as e:
+            bt.logging.error(f"❌ Build score report failed | error={e}")
+            return {
+                "workerScores": [],
+                "timestamp": self._utc_now_iso(),
+                "version": "1.0",
+            }
+
+    async def publish_score_report(self, effective_at: Optional[str] = None) -> None:
+        """Publish a score report on demand (event-driven)."""
+        if not self.session:
+            return
+        payload = self._build_score_report(effective_at_iso=effective_at)
+        if payload.get("workerScores"):
+            await self._send_encrypted_ws("MESH_SCORE_REPORT_V1", payload)

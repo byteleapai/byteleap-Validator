@@ -57,8 +57,11 @@ source ./venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Setup PostgreSQL database
-./scripts/setup_database.sh setup
+# Modify the relevant parameters of wallet
+cd config
+cp validator_config.yaml.example validator_config.yaml
+
+# Setup PostgreSQL database, skip this if you use sqlite (default config)
 (cp scripts/setup_database.sh /tmp; cd /tmp; sudo -u postgres /tmp/setup_database.sh setup)
 ```
 

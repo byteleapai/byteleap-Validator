@@ -9,11 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import bittensor as bt
 
-from neurons.validator.models.database import (
-    ComputeChallenge,
-    DatabaseManager,
-    WorkerInfo,
-)
+from neurons.validator.models.database import (ComputeChallenge,
+                                               DatabaseManager, WorkerInfo)
 
 
 class WorkerPerformanceScore:

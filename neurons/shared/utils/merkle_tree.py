@@ -33,10 +33,10 @@ class MerkleProof:
 
 class MerkleTree:
     """
-    Merkle tree implementation optimized for challenge verification.
+    Merkle tree implementation for challenge verification.
 
     Features:
-    - Efficient proof generation for arbitrary row indices
+    - Proof generation for arbitrary row indices
     - Batch proof generation for multiple rows
     - Secure hashing using SHA-256
     - Handles non-power-of-2 leaf counts

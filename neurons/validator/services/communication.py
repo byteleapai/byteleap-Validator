@@ -11,18 +11,15 @@ from typing import Any, Dict, Type
 import bittensor as bt
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
 
-from neurons.shared.communication_logging import CommunicationLogger, NetworkRecorder
+from neurons.shared.communication_logging import (CommunicationLogger,
+                                                  NetworkRecorder)
 from neurons.shared.crypto import CryptoManager
-from neurons.shared.protocols import (
-    CommunicationResult,
-    EncryptedSynapse,
-    ErrorCodes,
-    SessionInitRequest,
-    SessionInitResponse,
-    SessionInitSynapse,
-)
+from neurons.shared.protocols import (CommunicationResult, EncryptedSynapse,
+                                      ErrorCodes, SessionInitRequest,
+                                      SessionInitResponse, SessionInitSynapse)
 from neurons.shared.synapse import SynapseHandler
-from neurons.validator.services.processor_factory import ValidatorProcessorFactory
+from neurons.validator.services.processor_factory import \
+    ValidatorProcessorFactory
 from neurons.validator.services.session_manager import SessionManager
 from neurons.validator.synapse_processor import SynapseProcessor
 
@@ -72,7 +69,7 @@ class ValidatorCommunicationService:
 
         protocol_key = synapse_type.PROTOCOL_TYPE
         self._processors[protocol_key] = processor
-        bt.logging.debug(f"📝 Registered processor for {protocol_key}")
+        bt.logging.debug(f"Registered processor for {protocol_key}")
 
     async def handle_session_init(
         self, synapse: SessionInitSynapse
@@ -174,7 +171,7 @@ class ValidatorCommunicationService:
         start_time = time.time()
         synapse_type = type(synapse)
         if not hasattr(synapse_type, "PROTOCOL_TYPE"):
-            # No fallback: treat as protocol mismatch
+            # Treat as protocol mismatch
             peer_address = self.synapse_handler.get_peer_address(synapse)
             self.logger.log_validation_error(
                 "protocol_mismatch", "Missing PROTOCOL_TYPE", peer_address
@@ -242,11 +239,11 @@ class ValidatorCommunicationService:
                             result.error_code = error_code
                             result.error_message = actual_message
                         except (ValueError, IndexError):
-                            # Fallback to original message if parsing fails
+                            # Use original message if parsing fails
                             result.error_code = ErrorCodes.SESSION_UNKNOWN
                             result.error_message = error_msg
                     else:
-                        # Fallback for unstructured error messages
+                        # Handle unstructured error messages
                         if (
                             "not found" in error_msg.lower()
                             or "expired" in error_msg.lower()

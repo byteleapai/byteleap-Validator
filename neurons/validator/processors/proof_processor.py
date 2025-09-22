@@ -9,10 +9,12 @@ from typing import Any, Dict, List, Tuple, Type
 
 import bittensor as bt
 
-from neurons.shared.protocols import ChallengeProofSynapse, ProofData, ProofResponse
+from neurons.shared.protocols import (ChallengeProofSynapse, ProofData,
+                                      ProofResponse)
 from neurons.shared.utils.error_handler import ErrorHandler
 from neurons.validator.challenge_status import ChallengeStatus
 from neurons.validator.models.database import ComputeChallenge
+from neurons.validator.services.proof_cache import LRUProofCache
 from neurons.validator.synapse_processor import SynapseProcessor
 
 
@@ -29,9 +31,16 @@ class ProofProcessor(SynapseProcessor):
     Actual verification is handled by AsyncChallengeVerifier
     """
 
-    def __init__(self, communicator, database_manager, verification_config=None):
+    def __init__(
+        self,
+        communicator,
+        database_manager,
+        proof_cache: LRUProofCache,
+        verification_config=None,
+    ):
         super().__init__(communicator)
         self.database_manager = database_manager
+        self.proof_cache = proof_cache
         self.error_handler = ErrorHandler()
         self.verification_config = verification_config or {}
 
@@ -86,16 +95,42 @@ class ProofProcessor(SynapseProcessor):
                 if validation_error:
                     return {"error": validation_error}, 1
 
-                # Store proof data in database for async verification
+                # Store proof data in memory cache for async verification
                 # SECURITY: Only serialize proofs for verified commitments
                 verified_proofs = self._filter_verified_proofs(challenge, proofs)
                 proof_data_dict = self._serialize_proof_data(verified_proofs)
 
-                # Update challenge with proof data
-                challenge.verification_data = {
+                # Store in LRU cache and handle evictions
+                cache_data = {
                     "proofs": proof_data_dict,
                     "received_at": datetime.utcnow().isoformat(),
+                    "challenge_id": challenge_id,
                 }
+                evicted_challenge_ids = self.proof_cache.store_proof(
+                    peer_hotkey, cache_data
+                )
+
+                # Mark evicted challenges as failed
+                if evicted_challenge_ids:
+                    evicted_challenges = (
+                        session.query(ComputeChallenge)
+                        .filter(
+                            ComputeChallenge.challenge_id.in_(evicted_challenge_ids)
+                        )
+                        .all()
+                    )
+
+                    for evicted_challenge in evicted_challenges:
+                        evicted_challenge.challenge_status = ChallengeStatus.FAILED
+                        evicted_challenge.verification_result = False
+                        evicted_challenge.verification_notes = (
+                            "Cache eviction - queue full"
+                        )
+                        evicted_challenge.verified_at = datetime.utcnow()
+
+                    bt.logging.warning(
+                        f"⚠️ Cache eviction | evicted={len(evicted_challenge_ids)} challenges due to queue full"
+                    )
 
                 # Store debug info if available
                 if proof_data.debug_info:
@@ -127,7 +162,7 @@ class ProofProcessor(SynapseProcessor):
                 session.commit()
 
                 bt.logging.info(
-                    f"✅ Phase 2: Proof data stored for challenge {challenge_id}, "
+                    f"✅ Phase 2: Proof data cached for challenge {challenge_id}, "
                     f"queued for async verification"
                 )
 

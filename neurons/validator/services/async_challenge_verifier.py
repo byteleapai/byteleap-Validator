@@ -5,34 +5,12 @@ Handles background verification of committed challenges using batch processing
 
 import asyncio
 import concurrent.futures
+import math
+import multiprocessing as mp
+import signal
+from collections import OrderedDict
 
-# --- Module-level helpers for ProcessPool workers (must be picklable) ---
-def _generate_matrix_element_worker(seed_hash: int, row: int, col: int, matrix_type: int) -> float:
-    element_id = seed_hash ^ (row << 32) ^ (col << 16) ^ matrix_type
-    element_id = element_id & 0xFFFFFFFFFFFFFFFF
-
-    # GPU cutlass_gemm.cu compatible 32-bit hash
-    hash_val = (element_id ^ (element_id >> 32)) & 0xFFFFFFFF
-    hash_val = (hash_val * 0x9E3779B9 + 0x85EBCA6B) & 0xFFFFFFFF
-    hash_val = hash_val ^ (hash_val >> 16)
-    hash_val = (hash_val * 0x85EBCA6B) & 0xFFFFFFFF
-
-    # Convert to [-1, 1] range
-    normalized = (hash_val & 0xFFFF) / 32768.0 - 1.0
-    return normalized
-
-
-def _compute_matrix_element_gemm_worker(
-    seed_hash: int, matrix_size: int, row: int, col: int, iterations: int
-) -> float:
-    result = 0.0
-    for k in range(matrix_size):
-        a_element = _generate_matrix_element_worker(seed_hash, row, k, 0)
-        b_element = _generate_matrix_element_worker(seed_hash, k, col, 1)
-        result += a_element * b_element
-    if iterations > 1:
-        result *= iterations
-    return result
+import numpy as np
 
 
 def _verify_coords_worker(
@@ -45,62 +23,484 @@ def _verify_coords_worker(
     rel_tol: float,
     threshold: float,
 ) -> bool:
+    # Reduce redundant work across coordinates by caching A rows and B cols
     if not spot_check_coords or not spot_values:
         return True
     if len(spot_check_coords) != len(spot_values):
         return False
+
+    required = math.ceil(threshold * len(spot_check_coords))
     success = 0
-    total = len(spot_check_coords)
-    for i, coord in enumerate(spot_check_coords):
-        row, col = coord[0], coord[1]
-        expected = _compute_matrix_element_gemm_worker(
-            seed_hash, matrix_size, row, col, iterations
-        )
+
+    unique_rows = sorted({r for r, c in spot_check_coords})
+    unique_cols = sorted({c for r, c in spot_check_coords})
+
+    a_rows = {
+        r: _get_a_row_vector_cached(seed_hash, matrix_size, r) for r in unique_rows
+    }
+    b_cols = {
+        c: _get_b_col_vector_cached(seed_hash, matrix_size, c) for c in unique_cols
+    }
+
+    for i, (row, col) in enumerate(spot_check_coords):
+        expected = float(np.dot(a_rows[row], b_cols[col]))
+        if iterations > 1:
+            expected *= iterations
         claimed = spot_values[i]
         diff = abs(expected - claimed)
         rel = diff / (abs(expected) + 1e-10)
         if diff <= abs_tol or rel <= rel_tol:
             success += 1
-    return (success / total) >= threshold
+
+        remaining = len(spot_check_coords) - (i + 1)
+        # Early exit when outcome is decided
+        if success >= required:
+            return True
+        if success + remaining < required:
+            return False
+
+    return success >= required
 
 
 def _verify_row_sampling_worker(
     seed_hash: int,
     matrix_size: int,
     row_idx: int,
-    row_values: list,
+    coordinate_values: list,
+    row_start: int,
     iterations: int,
     sampling_columns: list,
     abs_tol: float,
     rel_tol: float,
     threshold: float,
+    b_cols_matrix: np.ndarray,
 ) -> bool:
-    if len(row_values) != matrix_size:
-        return False
     if not sampling_columns:
         return False
-    success = 0
-    total = len(sampling_columns)
-    for col_idx in sampling_columns:
-        expected = _compute_matrix_element_gemm_worker(
-            seed_hash, matrix_size, row_idx, col_idx, iterations
-        )
-        claimed = row_values[col_idx]
-        diff = abs(expected - claimed)
-        rel = diff / (abs(expected) + 1e-10)
-        if diff <= abs_tol or rel <= rel_tol:
-            success += 1
-    return (success / total) >= threshold
+
+    # Batch compute expected values for sampled columns using cached B cols
+    a_row = _get_a_row_vector_cached(seed_hash, matrix_size, row_idx)
+    expected_vec = a_row @ b_cols_matrix
+    if iterations > 1:
+        expected_vec = expected_vec * float(iterations)
+
+    claimed = np.array(
+        [coordinate_values[row_start + c] for c in sampling_columns], dtype=np.float64
+    )
+    diff = np.abs(expected_vec - claimed)
+    rel = diff / (np.abs(expected_vec) + 1e-10)
+    ok = (diff <= abs_tol) | (rel <= rel_tol)
+    success = int(np.count_nonzero(ok))
+    required = math.ceil(threshold * len(sampling_columns))
+    return success >= required
+
+
+def _pool_worker_initializer() -> None:
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        # Ignore environments without SIGINT support
+        pass
+
+
+def _transform_gpu_seed_worker(gpu_seed_str: str) -> int:
+    import hashlib
+
+    seed_hash = hashlib.sha256(gpu_seed_str.encode()).digest()
+    transformed_seed = int.from_bytes(seed_hash[:8], byteorder="little")
+    return transformed_seed
+
+
+from typing import Any, Dict, List, Tuple
+
+
+def _compute_row_hash_from_segment_worker(
+    values: List[float], start: int, length: int
+) -> str:
+    # GPU worker row hashing compatibility with CUDA FNV-1a on FP16
+    import struct
+
+    hash_val = 0xCBF29CE484222325
+    fnv_prime = 0x100000001B3
+
+    end = start + length
+    for i in range(start, end):
+        fp16_bytes = struct.pack("<e", float(values[i]))
+        element_bits = struct.unpack("<H", fp16_bytes)[0]
+        hash_val ^= element_bits
+        hash_val = (hash_val * fnv_prime) & 0xFFFFFFFFFFFFFFFF
+
+    return f"{hash_val:016x}"
+
+
+# Vectorized element generators with per-process LRU caches
+_MAX_A_CACHE = 64
+_MAX_B_CACHE = 64
+_A_ROW_CACHE: "OrderedDict[Tuple[int,int,int], np.ndarray]" = OrderedDict()
+_B_COL_CACHE: "OrderedDict[Tuple[int,int,int], np.ndarray]" = OrderedDict()
+
+
+def _lru_get(cache: OrderedDict, key: Tuple[int, int, int]):
+    val = cache.get(key)
+    if val is not None:
+        cache.move_to_end(key)
+    return val
+
+
+def _lru_set(
+    cache: OrderedDict, key: Tuple[int, int, int], val: np.ndarray, max_size: int
+) -> np.ndarray:
+    cache[key] = val
+    cache.move_to_end(key)
+    if len(cache) > max_size:
+        cache.popitem(last=False)
+    return val
+
+
+def _get_a_row_vector_cached(seed_hash: int, matrix_size: int, row: int) -> np.ndarray:
+    key = (int(seed_hash), int(matrix_size), int(row))
+    cached = _lru_get(_A_ROW_CACHE, key)
+    if cached is not None:
+        return cached
+    # Generate A(row, k) for k in [0..N)
+    N = int(matrix_size)
+    k = np.arange(N, dtype=np.uint64)
+    el = (
+        np.uint64(seed_hash)
+        ^ (np.uint64(row) << np.uint64(32))
+        ^ (k << np.uint64(16))
+        ^ np.uint64(0)
+    ) & np.uint64(0xFFFFFFFFFFFFFFFF)
+    h = (el ^ (el >> np.uint64(32))) & np.uint64(0xFFFFFFFF)
+    h = (h * np.uint64(0x9E3779B9) + np.uint64(0x85EBCA6B)) & np.uint64(0xFFFFFFFF)
+    h = h ^ (h >> np.uint64(16))
+    h = (h * np.uint64(0x85EBCA6B)) & np.uint64(0xFFFFFFFF)
+    arr = (h & np.uint64(0xFFFF)).astype(np.float64) / 32768.0 - 1.0
+    return _lru_set(_A_ROW_CACHE, key, arr, _MAX_A_CACHE)
+
+
+def _get_b_col_vector_cached(seed_hash: int, matrix_size: int, col: int) -> np.ndarray:
+    key = (int(seed_hash), int(matrix_size), int(col))
+    cached = _lru_get(_B_COL_CACHE, key)
+    if cached is not None:
+        return cached
+    # Generate B(k, col) for k in [0..N)
+    N = int(matrix_size)
+    k = np.arange(N, dtype=np.uint64)
+    el = (
+        np.uint64(seed_hash)
+        ^ (k << np.uint64(32))
+        ^ (np.uint64(col) << np.uint64(16))
+        ^ np.uint64(1)
+    ) & np.uint64(0xFFFFFFFFFFFFFFFF)
+    h = (el ^ (el >> np.uint64(32))) & np.uint64(0xFFFFFFFF)
+    h = (h * np.uint64(0x9E3779B9) + np.uint64(0x85EBCA6B)) & np.uint64(0xFFFFFFFF)
+    h = h ^ (h >> np.uint64(16))
+    h = (h * np.uint64(0x85EBCA6B)) & np.uint64(0xFFFFFFFF)
+    arr = (h & np.uint64(0xFFFF)).astype(np.float64) / 32768.0 - 1.0
+    return _lru_set(_B_COL_CACHE, key, arr, _MAX_B_CACHE)
+
+
+def _get_b_cols_matrix_cached(
+    seed_hash: int, matrix_size: int, columns: List[int]
+) -> np.ndarray:
+    # Avoid large recomputation by stacking cached column vectors
+    cols = [int(c) for c in columns]
+    vectors = [_get_b_col_vector_cached(seed_hash, matrix_size, c) for c in cols]
+    if len(vectors) == 1:
+        return vectors[0].reshape(-1, 1)
+    return np.column_stack(vectors)
+
+
+def _compute_cpu_matrix_rows_worker(
+    seed_hex: str, matrix_size: int, row_indices: List[int], iterations: int = 1
+) -> List[str]:
+    import hashlib
+
+    import numpy as np
+
+    from neurons.shared.challenges.cpu_matrix_challenge import \
+        CPUMatrixChallenge
+
+    seed = bytes.fromhex(seed_hex)
+    matrix_a, matrix_b = CPUMatrixChallenge._generate_matrices_from_seed(
+        seed, matrix_size
+    )
+
+    if iterations > 1:
+        result = np.dot(matrix_a.astype(np.int64), matrix_b.astype(np.int64))
+        for _ in range(iterations - 1):
+            result = np.dot(result, matrix_b.astype(np.int64))
+    else:
+        result = np.dot(matrix_a.astype(np.int64), matrix_b.astype(np.int64))
+
+    expected_hashes: List[str] = []
+    for row_idx in row_indices:
+        computed_row = result[row_idx]
+        expected_hash = hashlib.sha256(computed_row.tobytes()).hexdigest()[:16]
+        expected_hashes.append(expected_hash)
+
+    return expected_hashes
+
+
+def _verify_challenge_worker(
+    challenge_payload: Dict[str, Any],
+    proof_data: Dict[str, Any],
+    settings: Dict[str, Any],
+) -> Tuple[bool, Dict[str, Any]]:
+    import bittensor as bt
+
+    try:
+        challenge_type = challenge_payload.get("challenge_type")
+
+        abs_tol: float = settings["abs_tolerance"]
+        rel_tol: float = settings["rel_tolerance"]
+        threshold: float = settings["success_rate_threshold"]
+        row_sample_rate: float = settings["row_sample_rate"]
+
+        if challenge_type == "cpu_matrix":
+            cpu_proof = proof_data.get("-1")
+            if not cpu_proof:
+                return False, {"error": "No CPU proof found"}
+
+            challenge_data = challenge_payload["challenge_data"]
+            seed_hex = challenge_data["seed"]
+            matrix_size = challenge_data["matrix_size"]
+            iterations = challenge_data.get("iterations", 1)
+
+            trusted_rows_to_check = challenge_payload.get("verification_targets") or []
+            trusted_rows = [
+                item[0] for item in trusted_rows_to_check if item[1] is None
+            ]
+            if not trusted_rows:
+                return False, {"error": "No trusted rows"}
+
+            commitment_merkle_root = challenge_payload.get("merkle_commitments", {})
+            expected_merkle_root = commitment_merkle_root.get("-1")
+            if not expected_merkle_root:
+                return False, {"error": "No commitment found"}
+            if isinstance(expected_merkle_root, dict):
+                expected_merkle_root = expected_merkle_root.get("merkle_root")
+
+            row_hashes = cpu_proof.get("row_hashes", [])
+            merkle_proofs = cpu_proof.get("merkle_proofs", [])
+            if not row_hashes or not merkle_proofs:
+                return False, {"error": "CPU proof missing data"}
+
+            expected_hashes = _compute_cpu_matrix_rows_worker(
+                seed_hex, matrix_size, trusted_rows, iterations
+            )
+            if len(row_hashes) != len(expected_hashes) or expected_hashes != row_hashes:
+                return False, {"error": "Row hash mismatch"}
+
+            from neurons.shared.utils.merkle_tree import verify_row_proofs
+
+            merkle_valid, merkle_error = verify_row_proofs(
+                row_indices=trusted_rows,
+                row_hashes=row_hashes,
+                merkle_proofs=merkle_proofs,
+                expected_merkle_root=expected_merkle_root,
+            )
+            if not merkle_valid:
+                return False, {"error": f"CPU Merkle proof failed: {merkle_error}"}
+
+            total_rows = len(trusted_rows)
+            total_proofs = 1
+            successful = 1
+            details = {
+                "total_data_points": 0,
+                "total_rows": total_rows,
+                "successful_verifications": successful,
+                "total_proofs": total_proofs,
+                "success_count": successful,
+                "notes": f"Processed {total_rows} rows, verified {successful}/{total_proofs} proofs",
+            }
+            return True, details
+
+        elif challenge_type == "gpu_matrix":
+            challenge_data = challenge_payload["challenge_data"]
+            seed = challenge_data["seed"]
+            matrix_size = challenge_data["matrix_size"]
+            iterations = challenge_data.get("iterations", 1)
+
+            trusted_rows_to_check = challenge_payload.get("verification_targets") or []
+            commitment_merkle_root = challenge_payload.get("merkle_commitments", {})
+
+            # Count GPUs present in proofs
+            total_gpus = len([uuid for uuid in proof_data.keys() if uuid != "-1"])
+            if total_gpus == 0:
+                return False, {"error": "No GPU proofs"}
+
+            successful_verifications = 0
+
+            for gpu_uuid, gpu_proof in proof_data.items():
+                if gpu_uuid == "-1":
+                    continue
+
+                expected_merkle_root = commitment_merkle_root.get(gpu_uuid)
+                if not expected_merkle_root:
+                    continue
+                if isinstance(expected_merkle_root, dict):
+                    expected_merkle_root = expected_merkle_root.get("merkle_root")
+
+                trusted_coords = [
+                    [item[0], item[1]]
+                    for item in trusted_rows_to_check
+                    if len(item) >= 2 and item[1] is not None
+                ]
+                trusted_rows = [
+                    item[0]
+                    for item in trusted_rows_to_check
+                    if len(item) >= 2 and item[1] is None
+                ]
+
+                coordinate_values = gpu_proof.get("coordinate_values", [])
+                row_hashes = gpu_proof.get("row_hashes", [])
+                merkle_proofs = gpu_proof.get("merkle_proofs", [])
+
+                # Transform seed for this GPU
+                gpu_seed_str = f"{seed}|{gpu_uuid}"
+                seed_hash = _transform_gpu_seed_worker(gpu_seed_str)
+
+                # 1) Coordinate verification
+                if trusted_coords:
+                    if not coordinate_values or len(coordinate_values) < len(
+                        trusted_coords
+                    ):
+                        continue
+                    coord_values = coordinate_values[: len(trusted_coords)]
+                    coord_ok = _verify_coords_worker(
+                        seed_hash,
+                        matrix_size,
+                        trusted_coords,
+                        coord_values,
+                        iterations,
+                        abs_tol,
+                        rel_tol,
+                        threshold,
+                    )
+                    if not coord_ok:
+                        continue
+
+                # 2) Row verification by sampling
+                verified_rows = set()
+                if trusted_rows:
+                    required_len = len(trusted_coords) + len(trusted_rows) * matrix_size
+                    if not coordinate_values or len(coordinate_values) < required_len:
+                        continue
+
+                    import secrets
+
+                    crypto_random = secrets.SystemRandom()
+                    sample_count = max(1, int(matrix_size * float(row_sample_rate)))
+                    shared_sampling_columns = crypto_random.sample(
+                        range(matrix_size), min(sample_count, matrix_size)
+                    )
+                    shared_sampling_columns.sort()
+                    b_cols_matrix = _get_b_cols_matrix_cached(
+                        seed_hash, matrix_size, shared_sampling_columns
+                    )
+
+                    row_data_start = len(trusted_coords)
+                    for i, row_idx in enumerate(trusted_rows):
+                        row_start = row_data_start + i * matrix_size
+                        row_ok = _verify_row_sampling_worker(
+                            seed_hash,
+                            matrix_size,
+                            row_idx,
+                            coordinate_values,
+                            row_start,
+                            iterations,
+                            shared_sampling_columns,
+                            abs_tol,
+                            rel_tol,
+                            threshold,
+                            b_cols_matrix,
+                        )
+                        if row_ok:
+                            verified_rows.add(row_idx)
+
+                    if len(verified_rows) == 0:
+                        continue
+
+                # 3) Merkle verification of rows
+                if trusted_rows and row_hashes and merkle_proofs:
+                    if len(row_hashes) != len(trusted_rows) or len(
+                        merkle_proofs
+                    ) != len(trusted_rows):
+                        continue
+
+                    computed_row_hashes: List[str] = []
+                    for i, row_idx in enumerate(trusted_rows):
+                        if row_idx not in verified_rows:
+                            # Only trust rows that passed sampling
+                            continue
+
+                        row_start = len(trusted_coords) + i * matrix_size
+                        computed_hash = _compute_row_hash_from_segment_worker(
+                            coordinate_values, row_start, matrix_size
+                        )
+                        provided_hash = row_hashes[i]
+                        if computed_hash != provided_hash:
+                            computed_row_hashes = []
+                            break
+                        computed_row_hashes.append(computed_hash)
+
+                    if not computed_row_hashes or len(computed_row_hashes) != len(
+                        trusted_rows
+                    ):
+                        continue
+
+                    from neurons.shared.utils.merkle_tree import \
+                        verify_row_proofs
+
+                    merkle_ok, _ = verify_row_proofs(
+                        row_indices=trusted_rows,
+                        row_hashes=computed_row_hashes,
+                        merkle_proofs=merkle_proofs,
+                        expected_merkle_root=expected_merkle_root,
+                    )
+                    if not merkle_ok:
+                        continue
+
+                successful_verifications += 1
+
+            is_success = successful_verifications > 0
+
+            total_coordinates = len(
+                [item for item in trusted_rows_to_check if item[1] is not None]
+            )
+            total_rows = len(
+                [item for item in trusted_rows_to_check if item[1] is None]
+            )
+
+            details = {
+                "total_data_points": total_coordinates,
+                "total_rows": total_rows,
+                "successful_verifications": successful_verifications,
+                "total_proofs": total_gpus,
+                "success_count": successful_verifications,
+                "notes": f"Processed {total_coordinates} coordinates, {total_rows} rows, verified {successful_verifications}/{total_gpus} proofs",
+            }
+            return is_success, details
+
+        else:
+            return False, {"error": f"Unknown challenge type: {challenge_type}"}
+
+    except Exception as e:
+        bt.logging.error(f"Worker error verifying challenge: {e}")
+        return False, {"error": str(e)}
+
+
 import os
 import time
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Tuple
 
 import bittensor as bt
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
 
 from neurons.shared.config.config_manager import ConfigManager
-from neurons.shared.protocols import ProofData
 from neurons.validator.challenge_status import ChallengeStatus
 from neurons.validator.models.database import ComputeChallenge, DatabaseManager
 from neurons.validator.services.proof_cache import LRUProofCache
@@ -163,24 +563,21 @@ class AsyncChallengeVerifier:
             "validation.gpu.verification.success_rate_threshold", 0.0, 1.0, float
         )
 
-        # Extract coordinate verification settings
-        self.coordinate_sample_count = config.get(
-            "validation.gpu.verification.coordinate_sample_count"
-        )
-        self.row_verification_count = config.get(
-            "validation.gpu.verification.row_verification_count"
-        )
+        # Extract required verification settings only
 
         # Service state
         self.running = False
         self._verification_task = None
-        # Process pool for CPU-bound verification hotspots (bypass GIL)
         try:
+            ctx = mp.get_context("spawn")
             self._executor = concurrent.futures.ProcessPoolExecutor(
-                max_workers=self.concurrent_tasks
+                max_workers=self.concurrent_tasks,
+                mp_context=ctx,
+                initializer=_pool_worker_initializer,
             )
-        except Exception:
-            self._executor = None
+        except Exception as e:
+            bt.logging.error(f"❌ Failed to initialize ProcessPoolExecutor | error={e}")
+            raise
 
         bt.logging.info(
             f"AsyncChallengeVerifier initialized: "
@@ -201,16 +598,6 @@ class AsyncChallengeVerifier:
     def _get_success_rate_threshold(self) -> float:
         return self.config.get_range(
             "validation.gpu.verification.success_rate_threshold", 0.0, 1.0, float
-        )
-
-    def _get_coordinate_sample_count(self) -> int:
-        return int(
-            self.config.get("validation.gpu.verification.coordinate_sample_count")
-        )
-
-    def _get_row_verification_count(self) -> int:
-        return int(
-            self.config.get("validation.gpu.verification.row_verification_count")
         )
 
     def _get_verification_interval(self) -> int:
@@ -246,14 +633,42 @@ class AsyncChallengeVerifier:
             except asyncio.CancelledError:
                 pass
 
-        # Best-effort executor shutdown
+        # Best-effort executor shutdown with forced terminate of workers
         try:
             if getattr(self, "_executor", None):
-                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._shutdown_executor_forceful()
+        except Exception as e:
+            bt.logging.debug(f"Executor shutdown error ignored | error={e}")
+
+        bt.logging.info("⏹️ AsyncChallengeVerifier stopped")
+
+    def _shutdown_executor_forceful(self) -> None:
+        executor = getattr(self, "_executor", None)
+        if not executor:
+            return
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
 
-        bt.logging.info("⏹️ AsyncChallengeVerifier stopped")
+        try:
+            processes = getattr(executor, "_processes", {}) or {}
+            for p in list(processes.values()):
+                try:
+                    if p.is_alive():
+                        p.terminate()
+                except Exception:
+                    continue
+            # Optional short join to avoid lingering children
+            for p in list(processes.values()):
+                try:
+                    if p.is_alive():
+                        p.join(timeout=0.3)
+                except Exception:
+                    continue
+        except Exception:
+            # Private API best-effort only
+            pass
 
     async def _verification_loop(self) -> None:
         """Main verification loop - processes committed challenges in batches"""
@@ -310,25 +725,86 @@ class AsyncChallengeVerifier:
 
     def _get_oldest_verifying_challenges(self) -> List[ComputeChallenge]:
         """
-        Get oldest pending challenges in VERIFYING state for verification
+        Get newest VERIFYING challenges, and mark stale ones (>1h) failed
 
-        Returns:
-            List of pending challenges ordered by creation time
+        Returns latest-first list limited by concurrency
         """
         try:
+            now_utc = datetime.utcnow()
+            stale_cutoff = now_utc - timedelta(hours=1)
+
             with self.database_manager.get_session() as session:
+                # Mark stale challenges as failed
+                stale_list = (
+                    session.query(ComputeChallenge)
+                    .filter(
+                        ComputeChallenge.challenge_status == ChallengeStatus.VERIFYING,
+                        ComputeChallenge.deleted_at.is_(None),
+                        ComputeChallenge.computed_at.isnot(None),
+                        ComputeChallenge.computed_at < stale_cutoff,
+                    )
+                    .all()
+                )
+
+                if stale_list:
+                    for db_challenge in stale_list:
+                        db_challenge.challenge_status = ChallengeStatus.FAILED
+                        db_challenge.verification_result = False
+                        db_challenge.verified_at = now_utc
+                        db_challenge.verification_time_ms = 0.0
+                        db_challenge.is_success = False
+                        db_challenge.verification_notes = (
+                            "Timeout: proof stale (>1h since computed_at)"
+                        )
+                        if db_challenge.worker_id:
+                            try:
+                                self.database_manager.update_worker_task_statistics(
+                                    session=session,
+                                    hotkey=db_challenge.hotkey,
+                                    worker_id=db_challenge.worker_id,
+                                    is_success=False,
+                                    computation_time_ms=None,
+                                )
+                            except Exception:
+                                pass
+                        try:
+                            self._update_challenge_gpu_activity(
+                                session, db_challenge, False
+                            )
+                        except Exception:
+                            pass
+
+                    try:
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+
+                    # Best-effort cache cleanup
+                    for db_challenge in stale_list:
+                        try:
+                            cache_key = (
+                                f"{db_challenge.hotkey}:{db_challenge.worker_id}"
+                            )
+                            self.proof_cache.remove_proof(cache_key)
+                        except Exception:
+                            pass
+
+                # Fetch latest challenges (newest first)
                 challenges = (
                     session.query(ComputeChallenge)
                     .filter(
                         ComputeChallenge.challenge_status == ChallengeStatus.VERIFYING,
                         ComputeChallenge.deleted_at.is_(None),
                     )
-                    .order_by(ComputeChallenge.created_at.asc())
+                    .order_by(
+                        ComputeChallenge.computed_at.desc().nullslast(),
+                        ComputeChallenge.created_at.desc(),
+                    )
                     .limit(self._get_concurrent_tasks())
                     .all()
                 )
 
-                bt.logging.debug(f"Challenges pending | count={len(challenges)}")
+                bt.logging.debug(f"Challenges pending | fetched={len(challenges)}")
                 return challenges
 
         except Exception as e:
@@ -352,10 +828,98 @@ class AsyncChallengeVerifier:
                 f"start verification | challenge_id={challenge.challenge_id}"
             )
 
-            # Create mock proof data from challenge
-            # The actual verification logic will be extracted from ProofProcessor
-            success, verification_details = await self._perform_challenge_verification(
-                challenge
+            # Timeout guard: skip stale proofs (> 1 hour since computed_at)
+            try:
+                if challenge.computed_at is not None:
+                    now_utc = datetime.utcnow()
+                    age_seconds = (now_utc - challenge.computed_at).total_seconds()
+                    if age_seconds > 3600:
+                        with self.database_manager.get_session() as session:
+                            db_challenge = session.get(ComputeChallenge, challenge.id)
+                            if db_challenge:
+                                db_challenge.challenge_status = ChallengeStatus.FAILED
+                                db_challenge.verification_result = False
+                                db_challenge.verified_at = now_utc
+                                db_challenge.verification_time_ms = (
+                                    time.time() - verification_start_time
+                                ) * 1000
+                                db_challenge.is_success = False
+                                db_challenge.verification_notes = (
+                                    "Timeout: proof stale (>1h since computed_at)"
+                                )
+                                # Update worker task statistics on timeout
+                                if db_challenge.worker_id:
+                                    try:
+                                        self.database_manager.update_worker_task_statistics(
+                                            session=session,
+                                            hotkey=db_challenge.hotkey,
+                                            worker_id=db_challenge.worker_id,
+                                            is_success=False,
+                                            computation_time_ms=None,
+                                        )
+                                    except Exception:
+                                        pass
+                                session.commit()
+                        # Best-effort cache cleanup for this worker
+                        try:
+                            cache_key = f"{challenge.hotkey}:{challenge.worker_id}"
+                            self.proof_cache.remove_proof(cache_key)
+                        except Exception:
+                            pass
+                        return False, {"error": "stale_timeout"}
+            except Exception:
+                # Non-fatal; continue to verification path
+                pass
+
+            # Prepare per-challenge payload and offload verification
+            cache_key = f"{challenge.hotkey}:{challenge.worker_id}"
+            cached_proof = self.proof_cache.get_proof(cache_key)
+            if not cached_proof:
+                bt.logging.error(
+                    f"No cached proof found for challenge {challenge.challenge_id}, key={cache_key[:12]}..."
+                )
+                return False, {"error": "No cached proof data"}
+
+            if cached_proof.get("challenge_id") != challenge.challenge_id:
+                bt.logging.error(
+                    f"Cached proof challenge_id mismatch: expected={challenge.challenge_id}, cached={cached_proof.get('challenge_id')}"
+                )
+                return False, {"error": "Challenge ID mismatch"}
+
+            proof_data = cached_proof.get("proofs", {})
+            if not proof_data:
+                bt.logging.error(
+                    f"No proof data in cache for challenge {challenge.challenge_id}"
+                )
+                return False, {"error": "No proof data in cache"}
+
+            challenge_payload = {
+                "id": challenge.id,
+                "challenge_id": challenge.challenge_id,
+                "hotkey": challenge.hotkey,
+                "worker_id": challenge.worker_id,
+                "challenge_type": challenge.challenge_type,
+                "challenge_data": challenge.challenge_data,
+                "verification_targets": challenge.verification_targets,
+                "merkle_commitments": challenge.merkle_commitments,
+            }
+
+            settings = {
+                "abs_tolerance": self._get_abs_tolerance(),
+                "rel_tolerance": self._get_rel_tolerance(),
+                "success_rate_threshold": self._get_success_rate_threshold(),
+                "row_sample_rate": self.config.get_range(
+                    "validation.gpu.verification.row_sample_rate", 0.0, 1.0, float
+                ),
+            }
+
+            loop = asyncio.get_event_loop()
+            success, verification_details = await loop.run_in_executor(
+                self._executor,
+                _verify_challenge_worker,
+                challenge_payload,
+                proof_data,
+                settings,
             )
 
             # Update verification results in database
@@ -405,9 +969,10 @@ class AsyncChallengeVerifier:
                         f"success={success} duration_ms={verification_time_ms:.1f}"
                     )
 
-                    # Remove cached proof for this hotkey after processing
+                    # Remove cached proof for this worker after processing
                     try:
-                        self.proof_cache.remove_proof(db_challenge.hotkey)
+                        cache_key = f"{db_challenge.hotkey}:{db_challenge.worker_id}"
+                        self.proof_cache.remove_proof(cache_key)
                     except Exception:
                         pass
 
@@ -453,7 +1018,10 @@ class AsyncChallengeVerifier:
 
                         # Best-effort cache cleanup on failure
                         try:
-                            self.proof_cache.remove_proof(db_challenge.hotkey)
+                            cache_key = (
+                                f"{db_challenge.hotkey}:{db_challenge.worker_id}"
+                            )
+                            self.proof_cache.remove_proof(cache_key)
                         except Exception:
                             pass
 
@@ -506,1437 +1074,6 @@ class AsyncChallengeVerifier:
         if gpu_count > 0:
             pass
 
-    async def _perform_challenge_verification(
-        self, challenge: ComputeChallenge
-    ) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Perform the actual challenge verification logic
-
-        Args:
-            challenge: Challenge to verify
-
-        Returns:
-            Tuple of (success, verification_details)
-        """
-        challenge_type = challenge.challenge_type
-
-        cached_proof = self.proof_cache.get_proof(challenge.hotkey)
-        if not cached_proof:
-            bt.logging.error(
-                f"No cached proof data found for challenge {challenge.challenge_id}, hotkey={challenge.hotkey[:8]}..."
-            )
-            return False, {"error": "No cached proof data"}
-
-        if cached_proof.get("challenge_id") != challenge.challenge_id:
-            bt.logging.error(
-                f"Cached proof challenge_id mismatch: expected={challenge.challenge_id}, cached={cached_proof.get('challenge_id')}"
-            )
-            return False, {"error": "Challenge ID mismatch"}
-
-        proof_data = cached_proof.get("proofs", {})
-        if not proof_data:
-            bt.logging.error(
-                f"No proof data in cache for challenge {challenge.challenge_id}"
-            )
-            return False, {"error": "No proof data in cache"}
-
-        if challenge_type == "cpu_matrix":
-            return await self._verify_cpu_challenge(challenge, proof_data)
-        elif challenge_type == "gpu_matrix":
-            return await self._verify_gpu_challenge(challenge, proof_data)
-        else:
-            bt.logging.error(f"❌ Unknown challenge type | type={challenge_type}")
-            return False, {"error": f"Unknown challenge type: {challenge_type}"}
-
-    async def _verify_cpu_challenge(
-        self, challenge: ComputeChallenge, proof_data: Dict
-    ) -> Tuple[bool, Dict[str, Any]]:
-        """Verify CPU matrix challenge"""
-        bt.logging.debug(f"CPU challenge verify | id={challenge.challenge_id}")
-
-        try:
-
-            cpu_proof = proof_data.get("-1")
-            if not cpu_proof:
-                bt.logging.error(
-                    f"No CPU proof found (UUID '-1') for challenge {challenge.challenge_id}"
-                )
-                return False, {"error": "No CPU proof found"}
-
-            challenge_data = challenge.challenge_data
-            seed = bytes.fromhex(challenge_data["seed"])
-            matrix_size = challenge_data["matrix_size"]
-            iterations = challenge_data.get("iterations", 1)
-
-            trusted_rows_to_check = challenge.verification_targets or []
-            trusted_rows = [
-                item[0] for item in trusted_rows_to_check if item[1] is None
-            ]
-
-            if not trusted_rows:
-                bt.logging.error(
-                    f"No trusted rows for CPU verification of challenge {challenge.challenge_id}"
-                )
-                return False, {"error": "No trusted rows"}
-
-            commitment_merkle_root = challenge.merkle_commitments or {}
-            expected_merkle_root = commitment_merkle_root.get("-1")
-            if not expected_merkle_root:
-                bt.logging.error(
-                    f"No commitment found for CPU challenge {challenge.challenge_id}"
-                )
-                return False, {"error": "No commitment found"}
-
-            # Extract merkle root if it's a dict
-            if isinstance(expected_merkle_root, dict):
-                expected_merkle_root = expected_merkle_root.get("merkle_root")
-
-            # Verify using CPU verification logic
-            verification_result = await self._verify_cpu_matrix(
-                seed=seed,
-                matrix_size=matrix_size,
-                proof_data=cpu_proof,
-                expected_merkle_root=expected_merkle_root,
-                trusted_rows=trusted_rows,
-                iterations=iterations,
-            )
-
-            # Create detailed verification statistics
-            verification_details = {
-                "total_data_points": 0,  # CPU doesn't verify coordinates
-                "total_rows": len(trusted_rows),
-                "successful_verifications": 1 if verification_result else 0,
-                "total_proofs": 1,
-                "success_count": 1 if verification_result else 0,
-                "notes": f"Processed 0 coordinates, {len(trusted_rows)} rows, verified {1 if verification_result else 0}/1 proofs",
-            }
-
-            return verification_result, verification_details
-
-        except Exception as e:
-            bt.logging.error(
-                f"CPU verification error for challenge {challenge.challenge_id}: {e}"
-            )
-            return False, {"error": f"CPU verification error: {str(e)}"}
-
-    async def _verify_gpu_challenge(
-        self, challenge: ComputeChallenge, proof_data: Dict
-    ) -> Tuple[bool, Dict[str, Any]]:
-        """Verify GPU matrix challenge"""
-        bt.logging.debug(f"GPU challenge verify | id={challenge.challenge_id}")
-
-        try:
-            # Get challenge parameters
-            challenge_data = challenge.challenge_data
-            seed = challenge_data["seed"]
-            matrix_size = challenge_data["matrix_size"]
-            iterations = challenge_data.get("iterations", 1)
-
-            # Get trusted verification targets
-            trusted_rows_to_check = challenge.verification_targets or []
-            bt.logging.debug(
-                f"Retrieved {len(trusted_rows_to_check)} verification targets for GPU challenge {challenge.challenge_id}"
-            )
-            if trusted_rows_to_check:
-                bt.logging.debug(
-                    f"First few targets: {trusted_rows_to_check[:5]}, last few: {trusted_rows_to_check[-5:]}"
-                )
-
-            # Get commitment data
-            commitment_merkle_root = challenge.merkle_commitments or {}
-
-            successful_verifications = 0
-            # Validation: Ensure proof_data is well-formed
-            if not isinstance(proof_data, dict):
-                bt.logging.error(
-                    f"🚨 SECURITY: Invalid proof_data structure for challenge {challenge.challenge_id}"
-                )
-                return False
-
-            # Count GPU entries, excluding CPU "-1"
-            total_gpus = len([uuid for uuid in proof_data.keys() if uuid != "-1"])
-
-            if total_gpus == 0:
-                bt.logging.warning(
-                    f"No valid GPU proof data found for challenge {challenge.challenge_id}"
-                )
-                return False
-
-            # Verify each GPU proof
-            for gpu_uuid, gpu_proof in proof_data.items():
-                if gpu_uuid == "-1":  # Skip CPU proofs in GPU challenges
-                    continue
-
-                # Get commitment for this GPU
-                expected_merkle_root = commitment_merkle_root.get(gpu_uuid)
-                if not expected_merkle_root:
-                    bt.logging.warning(
-                        f"No commitment found for GPU {gpu_uuid} in challenge {challenge.challenge_id}"
-                    )
-                    continue
-
-                # Extract merkle root if it's a dict
-                if isinstance(expected_merkle_root, dict):
-                    expected_merkle_root = expected_merkle_root.get("merkle_root")
-
-                # Extract trusted coordinates and rows for this GPU
-                trusted_coords = [
-                    [item[0], item[1]]
-                    for item in trusted_rows_to_check
-                    if len(item) >= 2 and item[1] is not None
-                ]
-                trusted_rows = [
-                    item[0]
-                    for item in trusted_rows_to_check
-                    if len(item) >= 2 and item[1] is None
-                ]
-
-                # Verify this GPU
-                gpu_result = await self._verify_gpu_matrix(
-                    challenge=challenge,
-                    seed=seed,
-                    gpu_uuid=gpu_uuid,
-                    matrix_size=matrix_size,
-                    proof_data=gpu_proof,
-                    expected_merkle_root=expected_merkle_root,
-                    trusted_coords=trusted_coords,
-                    trusted_rows=trusted_rows,
-                    iterations=iterations,
-                )
-
-                if gpu_result:
-                    successful_verifications += 1
-
-            # GPU challenges pass if at least one GPU verifies successfully
-            is_success = successful_verifications > 0
-
-            # Log consolidated GPU verification results
-            bt.logging.debug(
-                f"GPU verification completed: {successful_verifications}/{total_gpus} GPUs passed"
-            )
-
-            # Calculate detailed statistics for GPU verification
-            trusted_rows_to_check = challenge.verification_targets or []
-            total_coordinates = len(
-                [item for item in trusted_rows_to_check if item[1] is not None]
-            )
-            total_rows = len(
-                [item for item in trusted_rows_to_check if item[1] is None]
-            )
-
-            verification_details = {
-                "total_data_points": total_coordinates,
-                "total_rows": total_rows,
-                "successful_verifications": successful_verifications,
-                "total_proofs": total_gpus,
-                "success_count": successful_verifications,
-                "notes": f"Processed {total_coordinates} coordinates, {total_rows} rows, verified {successful_verifications}/{total_gpus} proofs",
-            }
-
-            return is_success, verification_details
-
-        except Exception as e:
-            bt.logging.error(
-                f"GPU verification error for challenge {challenge.challenge_id}: {e}"
-            )
-            return False, {"error": f"GPU verification error: {str(e)}"}
-
-    async def _verify_cpu_matrix(
-        self,
-        seed: bytes,
-        matrix_size: int,
-        proof_data: Dict,
-        expected_merkle_root: str,
-        trusted_rows: List[int],
-        iterations: int = 1,
-    ) -> bool:
-        """CPU matrix verification with full row computation"""
-        try:
-            # Extract row hashes and merkle proofs
-            row_hashes = proof_data.get("row_hashes", [])
-            merkle_proofs = proof_data.get("merkle_proofs", [])
-
-            if not row_hashes or not merkle_proofs:
-                bt.logging.error(
-                    "❌ CPU proof missing data | missing=row_hashes_or_merkle_proofs"
-                )
-                return False
-
-            if not trusted_rows:
-                bt.logging.error("❌ No trusted rows for CPU verification")
-                return False
-
-            bt.logging.debug(
-                f"CPU verification: {len(trusted_rows)} rows, {len(row_hashes)} hashes"
-            )
-
-            # Step 1: Verify row hashes against re-computed hashes
-            expected_hashes = await self._compute_cpu_matrix_rows(
-                seed, matrix_size, trusted_rows, iterations
-            )
-
-            if len(row_hashes) != len(expected_hashes):
-                bt.logging.error(
-                    f"Expected {len(expected_hashes)} row hashes, got {len(row_hashes)}"
-                )
-                return False
-
-            if expected_hashes != row_hashes:
-                bt.logging.error("❌ Row hash mismatch")
-                return False
-
-            # Step 2: Verify Merkle proofs
-            from neurons.shared.utils.merkle_tree import verify_row_proofs
-
-            merkle_valid, merkle_error = verify_row_proofs(
-                row_indices=trusted_rows,
-                row_hashes=row_hashes,
-                merkle_proofs=merkle_proofs,
-                expected_merkle_root=expected_merkle_root,
-            )
-
-            if not merkle_valid:
-                bt.logging.error(
-                    f"CPU Merkle proof verification failed: {merkle_error}"
-                )
-                return False
-
-            bt.logging.debug(
-                "✅ CPU verification passed: row hashes and merkle proofs verified"
-            )
-            return True
-
-        except Exception as e:
-            bt.logging.error(f"❌ CPU verification error | error={e}")
-            return False
-
-    async def _verify_gpu_matrix(
-        self,
-        challenge: Any,  # ComputeChallenge object with metadata
-        seed: str,
-        gpu_uuid: str,
-        matrix_size: int,
-        proof_data: Dict,
-        expected_merkle_root: str,
-        trusted_coords: List[List[int]],
-        trusted_rows: List[int],
-        iterations: int = 1,
-    ) -> bool:
-        """
-        GPU matrix verification with three-step process
-        """
-        try:
-            # Check if we have required proof data
-            coordinate_values = proof_data.get("coordinate_values", [])
-            row_hashes = proof_data.get("row_hashes", [])
-            merkle_proofs = proof_data.get("merkle_proofs", [])
-
-            # Separate coordinate and row verification with proper data slicing
-            verified_rows = set()
-            gpu_seed_str = f"{seed}|{gpu_uuid}"
-            seed_hash = self._transform_gpu_seed(gpu_seed_str)
-
-            # Coordinate verification
-            coord_success = False
-            if trusted_coords and coordinate_values:
-                coord_values = coordinate_values[: len(trusted_coords)]
-                coord_valid = await self._verify_spot_check_coordinates(
-                    seed_hash, matrix_size, trusted_coords, coord_values, iterations
-                )
-                if not coord_valid:
-                    bt.logging.debug(
-                        f"❌ Coordinate verification failed for GPU {gpu_uuid}"
-                    )
-                    return False
-                coord_success = True
-
-            # Row verification
-            row_success = False
-            if trusted_rows and coordinate_values:
-
-                # Row data starts after coordinate data
-                row_data_start = len(trusted_coords)
-
-                import secrets
-
-                crypto_random = secrets.SystemRandom()
-                row_sample_rate = self.config.get_range(
-                    "validation.gpu.verification.row_sample_rate", 0.0, 1.0, float
-                )
-                sample_count = max(1, int(matrix_size * row_sample_rate))
-                shared_sampling_columns = crypto_random.sample(
-                    range(matrix_size), min(sample_count, matrix_size)
-                )
-                shared_sampling_columns.sort()
-
-                for i, row_idx in enumerate(trusted_rows):
-                    row_start = row_data_start + i * matrix_size
-                    row_end = row_start + matrix_size
-
-                    if row_end > len(coordinate_values):
-                        bt.logging.error(
-                            f"❌ Row data out of bounds: need {row_end}, have {len(coordinate_values)}"
-                        )
-                        return False
-
-                    row_values = coordinate_values[row_start:row_end]
-
-                    row_valid = await self._verify_full_row_with_sampling(
-                        seed_hash,
-                        matrix_size,
-                        row_idx,
-                        row_values,
-                        iterations,
-                        shared_sampling_columns,
-                    )
-                    if row_valid:
-                        verified_rows.add(row_idx)
-
-                # Check if enough rows passed
-                if len(verified_rows) == 0:
-                    bt.logging.debug(
-                        f"❌ No rows passed verification for GPU {gpu_uuid}"
-                    )
-                    return False
-                row_success = True
-            elif not trusted_coords and not trusted_rows and not coordinate_values:
-                pass  # No verification requested
-            else:
-                bt.logging.error(
-                    f"❌ Coordinate data mismatch for GPU {gpu_uuid}: coords={len(trusted_coords) if trusted_coords else 0}, rows={len(trusted_rows) if trusted_rows else 0}, values={len(coordinate_values) if coordinate_values else 0}"
-                )
-                return False
-            merkle_success = False
-            if trusted_rows and row_hashes and merkle_proofs:
-
-                if len(row_hashes) != len(trusted_rows) or len(merkle_proofs) != len(
-                    trusted_rows
-                ):
-                    bt.logging.error(
-                        f"❌ Row count mismatch for GPU {gpu_uuid}: "
-                        f"expected {len(trusted_rows)} rows, got {len(row_hashes)} hashes, {len(merkle_proofs)} proofs"
-                    )
-                    return False
-
-                computed_row_hashes = []
-                for i, row_idx in enumerate(trusted_rows):
-                    if row_idx not in verified_rows:
-                        bt.logging.error(
-                            f"❌ Row {row_idx} did not pass coordinate verification but has hash/proof"
-                        )
-                        return False
-
-                    # Worker-provided row data verified by sampling
-                    row_start = len(trusted_coords) + i * matrix_size
-                    row_end = row_start + matrix_size
-                    row_data = coordinate_values[row_start:row_end]
-
-                    computed_hash = self._compute_row_hash_from_data(row_data)
-                    computed_row_hashes.append(computed_hash)
-
-                    provided_hash = row_hashes[i]
-                    if computed_hash != provided_hash:
-                        bt.logging.error(
-                            f"❌ Row {row_idx} hash mismatch: computed {computed_hash[:16]}... vs provided {provided_hash[:16]}..."
-                        )
-                        return False
-
-                merkle_success = await self._verify_row_merkle_proofs(
-                    trusted_rows,
-                    computed_row_hashes,
-                    merkle_proofs,
-                    expected_merkle_root,
-                )
-
-                if not merkle_success:
-                    bt.logging.debug(
-                        f"❌ Row Merkle proof verification failed for GPU {gpu_uuid}"
-                    )
-                    return False
-            elif not trusted_rows and not row_hashes and not merkle_proofs:
-                # No row verification requested - this is valid when row_verification_count = 0
-                pass
-            elif trusted_rows:
-                bt.logging.warning(
-                    f"⚠️ Trusted rows specified but missing row_hashes or merkle_proofs for GPU {gpu_uuid}"
-                )
-                return False
-
-            # Special case: If both coordinate_sample_count = 0 and row_verification_count = 0, trust the result
-            if not trusted_coords and not trusted_rows:
-                bt.logging.info(
-                    f"✅ GPU {gpu_uuid} verification bypassed - both coordinate_sample_count and row_verification_count are 0 (trust mode)"
-                )
-                return True
-
-            # Log consolidated verification results with counts
-            results = []
-            if trusted_coords:
-                results.append(
-                    f"{len(trusted_coords)} coords ({'pass' if coord_success else 'fail'})"
-                )
-            if trusted_rows:
-                results.append(
-                    f"{len(trusted_rows)} rows ({'pass' if row_success else 'fail'})"
-                )
-                if row_hashes and merkle_proofs:
-                    results.append(
-                        f"{len(merkle_proofs)} merkles ({'pass' if merkle_success else 'fail'})"
-                    )
-            bt.logging.debug(
-                f"GPU {gpu_uuid} verification | results={', '.join(results)}"
-            )
-            return True
-
-        except Exception as e:
-            bt.logging.error(f"❌ GPU verification error | gpu={gpu_uuid} error={e}")
-            return False
-
-    async def _verify_coordinates_batch(
-        self,
-        challenge: Any,
-        seed: str,
-        gpu_uuid: str,
-        matrix_size: int,
-        trusted_coords: List[List[int]],
-        coordinate_values: List[float],
-        iterations: int,
-        proof_data: Dict,
-    ) -> Tuple[bool, Set[int]]:
-        """
-        Verify coordinates with mixed spot checks and full row data
-
-        Args:
-            challenge: ComputeChallenge object with metadata
-            seed: Challenge seed string
-            gpu_uuid: GPU UUID
-            matrix_size: Matrix size
-            trusted_coords: Mixed list of [row,col] and [row,None] requests
-            coordinate_values: Data layout [spot_check_values...][row1_full_data...][row2_full_data...]
-            iterations: Matrix multiplication iterations
-            proof_data: Dict containing row hashes and merkle proofs
-
-        Returns:
-            Tuple of (verification_success, verified_rows_set)
-        """
-        try:
-            if not trusted_coords or not coordinate_values:
-                bt.logging.warning(
-                    "Missing verification data - trusted_coords or coordinate_values empty"
-                )
-                return False, set()
-
-            gpu_seed_str = f"{seed}|{gpu_uuid}"
-            seed_hash = self._transform_gpu_seed(gpu_seed_str)
-
-            spot_check_coords = []
-            row_requests = []
-
-            for coord in trusted_coords:
-                if len(coord) == 2 and coord[1] is None:
-                    # Row request format: [row, None]
-                    row_requests.append(coord[0])
-                else:
-                    # Coordinate format: [row, col]
-                    spot_check_coords.append(coord)
-
-            spot_check_count = len(spot_check_coords)
-            row_data_count = len(row_requests) * matrix_size
-            expected_total = spot_check_count + row_data_count
-
-            if len(coordinate_values) != expected_total:
-                bt.logging.error(
-                    f"❌ Proof data mismatch: received {len(coordinate_values)} values, expected {expected_total} "
-                    f"({spot_check_count} spot checks + {len(row_requests)} rows × {matrix_size} = {expected_total})"
-                )
-                return False, set()
-
-            bt.logging.debug(
-                f"✅ Proof data layout verified: {spot_check_count} spot checks + {len(row_requests)} full rows"
-            )
-
-            verified_rows = set()
-
-            if spot_check_coords:
-                spot_values = coordinate_values[:spot_check_count]
-                spot_success = await self._verify_spot_check_coordinates(
-                    seed_hash, matrix_size, spot_check_coords, spot_values, iterations
-                )
-                if not spot_success:
-                    bt.logging.debug("Spot check coordinate verification failed")
-                    return False, set()
-                bt.logging.debug(
-                    f"✅ Spot check verification passed ({len(spot_check_coords)} coords)"
-                )
-
-            if row_requests:
-                import secrets
-
-                crypto_random = secrets.SystemRandom()
-                row_sample_rate = self.config.get_range(
-                    "validation.gpu.verification.row_sample_rate", 0.0, 1.0, float
-                )
-                sample_count = max(1, int(matrix_size * row_sample_rate))
-
-                shared_sampling_columns = crypto_random.sample(
-                    range(matrix_size), min(sample_count, matrix_size)
-                )
-                shared_sampling_columns.sort()
-
-                bt.logging.debug(
-                    f"Generated {len(shared_sampling_columns)} shared sampling columns for matrix caching"
-                )
-
-                row_data_start = spot_check_count
-                for i, row_idx in enumerate(row_requests):
-                    row_start = row_data_start + i * matrix_size
-                    row_end = row_start + matrix_size
-                    row_values = coordinate_values[row_start:row_end]
-
-                    row_success = await self._verify_full_row_with_sampling(
-                        seed_hash,
-                        matrix_size,
-                        row_idx,
-                        row_values,
-                        iterations,
-                        shared_sampling_columns,
-                    )
-
-                    if row_success:
-                        verified_rows.add(row_idx)
-
-                if len(verified_rows) == 0:
-                    bt.logging.error("❌ No rows passed verification")
-                    return False, set()
-
-                success_rate = len(verified_rows) / len(row_requests)
-                bt.logging.debug(
-                    f"Row verification: {len(verified_rows)}/{len(row_requests)} rows passed ({success_rate:.1%})"
-                )
-
-            return True, verified_rows
-
-        except Exception as e:
-            bt.logging.error(f"Coordinate verification error: {e}")
-            return False, set()
-
-    async def _verify_row_hashes_with_sampling(
-        self,
-        seed: str,
-        gpu_uuid: str,
-        matrix_size: int,
-        trusted_rows: List[int],
-        trusted_coords: List[List[int]],
-        coordinate_values: List[float],
-        row_hashes: List[str],
-        iterations: int,
-    ) -> tuple[bool, List[int], List[str]]:
-        """
-        Row hash verification with coordinate sampling and selective trust
-
-        Only trust sampling rows where coordinate verification passed 95% success rate
-        """
-        try:
-            if not trusted_rows or not row_hashes or not trusted_coords:
-                return False, [], []
-
-            # Transform seed for GPU
-            gpu_seed_str = f"{seed}|{gpu_uuid}"
-            seed_hash = self._transform_gpu_seed(gpu_seed_str)
-
-            # Group sampling coordinates by row
-            sampling_coords_by_row = self._group_sampling_coords_by_row(trusted_coords)
-
-            verified_row_indices = []
-            verified_row_hashes = []
-
-            # Check each trusted row
-            for row_idx, row_id in enumerate(trusted_rows):
-                if row_id not in sampling_coords_by_row:
-                    bt.logging.debug(
-                        f"No sampling coordinates for row {row_id}, skipping"
-                    )
-                    continue
-
-                # Get sampling coordinates for this row
-                row_sampling_coords = sampling_coords_by_row[row_id]
-
-                # Row sampling requires 95% coordinate verification success
-                row_coord_success = await self._verify_row_sampling_coordinates(
-                    seed_hash,
-                    matrix_size,
-                    row_id,
-                    row_sampling_coords,
-                    coordinate_values,
-                    iterations,
-                )
-
-                if row_coord_success:
-                    # Row passes verification threshold
-                    verified_row_indices.append(row_idx)
-                    verified_row_hashes.append(row_hashes[row_idx])
-
-            # Mandatory requirement: at least one sampling row must be trusted
-            if not verified_row_indices:
-                bt.logging.error(
-                    "No sampling rows could be trusted - verification failed"
-                )
-                return False, [], []
-
-            success_rate = len(verified_row_indices) / len(trusted_rows)
-            bt.logging.info(
-                f"Row trust analysis: {len(verified_row_indices)}/{len(trusted_rows)} rows trusted ({success_rate:.1%})"
-            )
-
-            return True, verified_row_indices, verified_row_hashes
-
-        except Exception as e:
-            bt.logging.error(f"Row hash verification error: {e}")
-            return False, [], []
-
-    def _transform_gpu_seed(self, gpu_seed_str: str) -> int:
-        """Transform GPU seed string to hash format matching GPU implementation"""
-        import hashlib
-
-        seed_hash = hashlib.sha256(gpu_seed_str.encode()).digest()
-        transformed_seed = int.from_bytes(seed_hash[:8], byteorder="little")
-        return transformed_seed
-
-    def _analyze_verification_pattern(
-        self, challenge: Any, trusted_coords: List[List[int]]
-    ) -> Dict[str, Any]:
-        """
-        Analyze rows_to_check pattern to determine optimal verification caching strategy
-
-        Parse rows_to_check to extract:
-        - Coordinate verification: [row, col] format
-        - Row verification: [row, null] format
-        - Analyze which rows/columns appear frequently to decide caching strategy
-        """
-        try:
-            rows_to_check = getattr(challenge, "verification_targets", [])
-            if not rows_to_check:
-                bt.logging.debug("No verification_targets found")
-                return {
-                    "coordinate_checks": [],
-                    "row_checks": [],
-                    "cache_rows": [],
-                    "cache_cols": [],
-                    "row_columns": {},
-                    "row_cache_threshold": 0,
-                    "col_cache_threshold": 0,
-                    "reason": "no_verification_pattern",
-                }
-
-            # Parse verification patterns
-            coordinate_checks = []  # [row, col] coordinate verification
-            row_checks = []  # [row, null] row verification
-
-            for item in rows_to_check:
-                if len(item) >= 2:
-                    row, col = item[0], item[1]
-                    if col is None:
-                        row_checks.append(row)  # Row hash verification
-                    else:
-                        coordinate_checks.append([row, col])  # Coordinate verification
-
-            # Count occurrences for each row and column
-            row_columns = {}  # {row: [col1, col2, ...]}
-            col_rows = {}  # {col: [row1, row2, ...]}
-
-            for row, col in coordinate_checks:
-                if row not in row_columns:
-                    row_columns[row] = []
-                row_columns[row].append(col)
-
-                if col not in col_rows:
-                    col_rows[col] = []
-                col_rows[col].append(row)
-
-            # Analyze caching value
-            total_coords = len(coordinate_checks)
-            if total_coords == 0:
-                bt.logging.debug("No coordinate checks found")
-                return {
-                    "coordinate_checks": [],
-                    "row_checks": row_checks,
-                    "cache_rows": [],
-                    "cache_cols": [],
-                    "row_columns": {},
-                    "row_cache_threshold": 0,
-                    "col_cache_threshold": 0,
-                    "reason": "no_coordinates",
-                }
-
-            # Determine caching thresholds
-            matrix_size = challenge.challenge_data["matrix_size"]
-
-            # Row sample rate determines verification intensity
-            row_sample_rate = self.config.get_range(
-                "validation.gpu.verification.row_sample_rate", 0.0, 1.0, float
-            )
-
-            # Row threshold: based on configured sample rate
-            row_cache_threshold = max(10, int(matrix_size * row_sample_rate))
-            # Column threshold: each fixed column is shared by ~row_verification_count rows
-            col_cache_threshold = max(5, int(self._get_row_verification_count() * 0.8))
-
-            # Determine which rows/columns should be cached with separate thresholds
-            cache_rows = [
-                row
-                for row, cols in row_columns.items()
-                if len(cols) >= row_cache_threshold
-            ]
-            cache_cols = [
-                col
-                for col, rows in col_rows.items()
-                if len(rows) >= col_cache_threshold
-            ]
-
-            # Detailed caching statistics for debugging
-            row_coord_counts = {row: len(cols) for row, cols in row_columns.items()}
-            col_coord_counts = {col: len(rows) for col, rows in col_rows.items()}
-
-            analysis = {
-                "coordinate_checks": coordinate_checks,
-                "row_checks": row_checks,
-                "cache_rows": cache_rows,
-                "cache_cols": cache_cols,
-                "row_columns": row_columns,  # Track which columns each row needs
-                "row_cache_threshold": row_cache_threshold,
-                "col_cache_threshold": col_cache_threshold,
-                "reason": f"row_threshold={row_cache_threshold}, col_threshold={col_cache_threshold}, cached_rows={len(cache_rows)}, cached_cols={len(cache_cols)}",
-            }
-
-            return analysis
-
-        except Exception as e:
-            bt.logging.warning(f"Failed to analyze verification pattern: {e}")
-            return {
-                "coordinate_checks": [],
-                "row_checks": [],
-                "cache_rows": [],
-                "cache_cols": [],
-                "row_columns": {},
-                "row_cache_threshold": 0,
-                "col_cache_threshold": 0,
-                "reason": f"analysis_error: {e}",
-            }
-
-    def _group_sampling_coords_by_row(
-        self, trusted_coords: List[List[int]]
-    ) -> Dict[int, List[List[int]]]:
-        """Group sampling coordinates by their row ID"""
-        coords_by_row = {}
-        for coord in trusted_coords:
-            if len(coord) >= 2:
-                row_id = coord[0]
-                if row_id not in coords_by_row:
-                    coords_by_row[row_id] = []
-                coords_by_row[row_id].append(coord)
-        return coords_by_row
-
-    async def _verify_random_coordinates(
-        self,
-        seed_hash: int,
-        matrix_size: int,
-        random_coords: List[List[int]],
-        coordinate_values: List[float],
-        iterations: int,
-    ) -> bool:
-        """Verify random coordinates individually"""
-        if not random_coords:
-            return True
-
-        bt.logging.debug(
-            f"Verifying {len(random_coords)} random coordinates individually"
-        )
-
-        if len(coordinate_values) != len(random_coords):
-            bt.logging.error(
-                f"Coordinate values count mismatch: {len(coordinate_values)} values vs {len(random_coords)} coordinates"
-            )
-            return False
-
-        success_count = 0
-        for i, coord in enumerate(random_coords):
-            row, col = coord[0], coord[1]
-
-            # Compute expected value
-            expected_value = self._compute_matrix_element_gemm(
-                seed_hash, matrix_size, row, col, iterations
-            )
-            claimed_value = coordinate_values[i]
-
-            # Check with tolerance
-            if self._values_match_with_tolerance(expected_value, claimed_value):
-                success_count += 1
-
-        success_rate = success_count / len(random_coords) if random_coords else 1.0
-        return success_rate >= self._get_success_rate_threshold()
-
-    async def _verify_coordinates(
-        self,
-        seed_hash: int,
-        matrix_size: int,
-        trusted_coords: List[List[int]],
-        coordinate_values: List[float],
-        iterations: int,
-        cache_analysis: Dict[str, Any],
-    ) -> Tuple[bool, Set[int]]:
-        """
-        Coordinate verification with caching
-
-        Uses cache when coordinates benefit from it, otherwise computes directly
-        """
-        try:
-            if not trusted_coords or not coordinate_values:
-                bt.logging.warning(
-                    "Missing verification data - trusted_coords or coordinate_values empty"
-                )
-                return False, set()
-
-            if len(coordinate_values) != len(trusted_coords):
-                bt.logging.error(
-                    f"Coordinate values count mismatch: {len(coordinate_values)} values vs {len(trusted_coords)} coordinates"
-                )
-                return False, set()
-
-            cache_rows = cache_analysis.get("cache_rows", [])
-            cache_cols = cache_analysis.get("cache_cols", [])
-            row_columns = cache_analysis.get("row_columns", {})
-
-            bt.logging.debug(
-                f"Coordinate verification: {len(trusted_coords)} coords, "
-                f"caching {len(cache_rows)} rows + {len(cache_cols)} cols"
-            )
-
-            # Generate caches only for rows/columns meeting threshold
-            a_matrix_cache = {}
-            for row in cache_rows:
-                a_matrix_cache[row] = self._compute_matrix_a_row(
-                    seed_hash, matrix_size, row
-                )
-
-            b_matrix_cache = {}
-            for col in cache_cols:
-                b_matrix_cache[col] = self._compute_matrix_b_column(
-                    seed_hash, matrix_size, col
-                )
-
-            # Verify coordinates with cache usage
-            success_count = 0
-            row_success_count = {}  # Track success per row
-
-            for i, coord in enumerate(trusted_coords):
-                row, col = coord[0], coord[1]
-
-                # Use cache if available, otherwise direct computation
-                if row in a_matrix_cache and col in b_matrix_cache:
-                    a_row = a_matrix_cache[row]
-                    b_col = b_matrix_cache[col]
-                    expected_value = (
-                        sum(a_row[k] * b_col[k] for k in range(matrix_size))
-                        * iterations
-                    )
-                else:
-                    # Direct computation
-                    expected_value = self._compute_matrix_element_gemm(
-                        seed_hash, matrix_size, row, col, iterations
-                    )
-
-                claimed_value = coordinate_values[i]
-
-                if self._values_match_with_tolerance(expected_value, claimed_value):
-                    success_count += 1
-
-                    # Track success count per row
-                    if row not in row_success_count:
-                        row_success_count[row] = 0
-                    row_success_count[row] += 1
-
-            # Determine which rows are fully verified through coordinate sampling
-            verified_rows = set()
-            for row, success_count_for_row in row_success_count.items():
-                total_coords_for_row = len(row_columns.get(row, []))
-                if (
-                    success_count_for_row == total_coords_for_row
-                    and total_coords_for_row > 0
-                ):
-                    verified_rows.add(row)
-
-            success_rate = (
-                success_count / len(trusted_coords) if trusted_coords else 1.0
-            )
-            bt.logging.debug(
-                f"Coordinate verification: {success_count}/{len(trusted_coords)} coords passed ({success_rate:.1%}), "
-                f"{len(verified_rows)} rows fully verified"
-            )
-
-            return success_rate >= self._get_success_rate_threshold(), verified_rows
-
-        except Exception as e:
-            bt.logging.error(f"Coordinate verification error: {e}")
-            return False, set()
-
-    async def _verify_row_merkle_proofs(
-        self,
-        trusted_rows: List[int],
-        row_hashes: List[str],
-        merkle_proofs: List[Dict],
-        expected_merkle_root: str,
-    ) -> bool:
-        """
-        Verify row Merkle proofs for [row, None] format entries
-
-        This verifies that miner-provided row_hashes can be proven against
-        the committed merkle_root through the provided merkle_proofs.
-
-        Args:
-            trusted_rows: List of row indices to verify
-            row_hashes: List of row hashes provided by miner
-            merkle_proofs: List of Merkle proofs for each row
-            expected_merkle_root: Committed Merkle root from Phase 1
-
-        Returns:
-            True if all row Merkle proofs verify successfully
-        """
-        try:
-            from neurons.shared.utils.merkle_tree import verify_row_proofs
-
-            bt.logging.debug(
-                f"Verifying {len(trusted_rows)} row Merkle proofs against root: {expected_merkle_root[:16]}..."
-            )
-
-            # Use the existing Merkle tree verification utility
-            is_valid, error_message = verify_row_proofs(
-                row_indices=trusted_rows,
-                row_hashes=row_hashes,
-                merkle_proofs=merkle_proofs,
-                expected_merkle_root=expected_merkle_root,
-            )
-
-            if not is_valid:
-                bt.logging.debug(
-                    f"❌ Row Merkle proof verification failed: {error_message}"
-                )
-                return False
-
-            return True
-
-        except Exception as e:
-            bt.logging.error(f"Error in row Merkle proof verification: {e}")
-            return False
-
-    async def _verify_spot_check_coordinates(
-        self,
-        seed_hash: int,
-        matrix_size: int,
-        spot_check_coords: List[List[int]],
-        spot_values: List[float],
-        iterations: int,
-    ) -> bool:
-        """
-        Verify random coordinate spot checks
-
-        Args:
-            seed_hash: Transformed GPU seed
-            matrix_size: Matrix size
-            spot_check_coords: List of [row, col] coordinates to verify
-            spot_values: Corresponding values for each coordinate
-            iterations: Matrix multiplication iterations
-        """
-        if not spot_check_coords or not spot_values:
-            return True
-
-        if len(spot_check_coords) != len(spot_values):
-            bt.logging.error(
-                f"Spot check data mismatch: {len(spot_check_coords)} coords vs {len(spot_values)} values"
-            )
-            return False
-
-        # Offload CPU-bound loop to process pool
-        loop = asyncio.get_event_loop()
-        abs_tol = self._get_abs_tolerance()
-        rel_tol = self._get_rel_tolerance()
-        threshold = self._get_success_rate_threshold()
-        if self._executor is None:
-            return _verify_coords_worker(
-                seed_hash,
-                matrix_size,
-                spot_check_coords,
-                spot_values,
-                iterations,
-                abs_tol,
-                rel_tol,
-                threshold,
-            )
-        return await loop.run_in_executor(
-            self._executor,
-            _verify_coords_worker,
-            seed_hash,
-            matrix_size,
-            spot_check_coords,
-            spot_values,
-            iterations,
-            abs_tol,
-            rel_tol,
-            threshold,
-        )
-
-    async def _verify_full_row_with_sampling(
-        self,
-        seed_hash: int,
-        matrix_size: int,
-        row_idx: int,
-        row_values: List[float],
-        iterations: int,
-        shared_sampling_columns: List[int] = None,
-    ) -> bool:
-        """
-        Verify full row by sampling shared columns for matrix caching efficiency
-
-        Args:
-            seed_hash: Transformed GPU seed
-            matrix_size: Matrix size
-            row_idx: Row index to verify
-            row_values: All values in the row (matrix_size elements)
-            iterations: Matrix multiplication iterations
-            shared_sampling_columns: Same columns used for all rows (e.g. [100, 250, 1024])
-        """
-        if len(row_values) != matrix_size:
-            bt.logging.error(
-                f"Row {row_idx} data size mismatch: {len(row_values)} vs {matrix_size}"
-            )
-            return False
-
-        sampling_columns = shared_sampling_columns
-        if not sampling_columns:
-            bt.logging.error("No sampling columns provided for row verification")
-            return False
-
-        # Offload CPU-bound sampling loop to process pool
-        loop = asyncio.get_event_loop()
-        abs_tol = self._get_abs_tolerance()
-        rel_tol = self._get_rel_tolerance()
-        threshold = self._get_success_rate_threshold()
-        if self._executor is None:
-            return _verify_row_sampling_worker(
-                seed_hash,
-                matrix_size,
-                row_idx,
-                row_values,
-                iterations,
-                sampling_columns,
-                abs_tol,
-                rel_tol,
-                threshold,
-            )
-        return await loop.run_in_executor(
-            self._executor,
-            _verify_row_sampling_worker,
-            seed_hash,
-            matrix_size,
-            row_idx,
-            row_values,
-            iterations,
-            sampling_columns,
-            abs_tol,
-            rel_tol,
-            threshold,
-        )
-
-    def _compute_row_hash_from_data(self, row_data: List[float]) -> str:
-        """
-        Compute FNV-1a hash from provided row data - matches CUDA implementation
-
-        Args:
-            row_data: List of float values for the row
-
-        Returns:
-            FNV-1a hash as 16-character lowercase hex string
-        """
-        import struct
-
-        # FNV-1a hash algorithm - matches CUDA implementation
-        hash_val = 0xCBF29CE484222325  # FNV offset basis
-        fnv_prime = 0x100000001B3  # FNV prime
-
-        for val in row_data:
-            # Float to FP16 bit representation for hashing
-            fp16_bytes = struct.pack("<e", float(val))  # IEEE 754 half precision
-            element_bits = struct.unpack("<H", fp16_bytes)[0]  # Read as uint16
-
-            # FNV-1a algorithm: XOR then multiply
-            hash_val ^= element_bits
-            hash_val *= fnv_prime
-            hash_val &= 0xFFFFFFFFFFFFFFFF  # Keep as 64-bit
-
-        # CUDA-compatible 16-character hex format
-        return f"{hash_val:016x}"
-
-    async def _verify_sampling_coordinates_cached(
-        self,
-        seed_hash: int,
-        matrix_size: int,
-        sampling_coords: List[List[int]],
-        coordinate_values: List[float],
-        iterations: int,
-        cache_info: Dict[str, Any] = None,
-    ) -> bool:
-        """
-        Verify sampling coordinates with precomputed A/B matrix caching
-        """
-        if not sampling_coords:
-            return True
-
-        bt.logging.debug(
-            f"Verifying {len(sampling_coords)} sampling coordinates with EXPLICIT caching"
-        )
-
-        # Use explicit cache information if available, otherwise analyze patterns
-        if cache_info and cache_info.get("is_precomputed", True):
-            # Use pre-computed exact cache requirements
-            rows_needed = set(cache_info.get("rows_needed", []))
-            cols_needed = set(cache_info.get("cols_needed", []))
-            efficiency_gain = cache_info.get("efficiency_gain", 1.0)
-
-            bt.logging.debug(
-                f"EXPLICIT caching: {len(rows_needed)} A-matrix rows + {len(cols_needed)} B-matrix columns "
-                f"(~{efficiency_gain:.1f}x pre-calculated efficiency)"
-            )
-        else:
-            # Analyze coordinate patterns
-            rows_needed = set(coord[0] for coord in sampling_coords)
-            cols_needed = set(coord[1] for coord in sampling_coords)
-            estimated_old_cols = len(sampling_coords)
-            efficiency_gain = (
-                estimated_old_cols / len(cols_needed) if cols_needed else 1.0
-            )
-
-            bt.logging.debug(
-                f"Selected caching plan: {len(rows_needed)} A-matrix rows + {len(cols_needed)} B-matrix columns "
-                f"(~{efficiency_gain:.1f}x detected efficiency)"
-            )
-
-        # Precompute and cache A matrix rows
-        a_matrix_cache = {}
-        for row in rows_needed:
-            a_matrix_cache[row] = self._compute_matrix_a_row(
-                seed_hash, matrix_size, row
-            )
-
-        # Precompute and cache B matrix columns
-        b_matrix_cache = {}
-        for col in cols_needed:
-            b_matrix_cache[col] = self._compute_matrix_b_column(
-                seed_hash, matrix_size, col
-            )
-
-        # Verify coordinates using cached matrices
-        if len(coordinate_values) != len(sampling_coords):
-            bt.logging.error(
-                f"Coordinate values count mismatch: {len(coordinate_values)} values vs {len(sampling_coords)} coordinates"
-            )
-            return False
-
-        success_count = 0
-        for i, coord in enumerate(sampling_coords):
-            row, col = coord[0], coord[1]
-
-            # Cached matrices enable O(1) coordinate access
-            if row in a_matrix_cache and col in b_matrix_cache:
-                a_row = a_matrix_cache[row]
-                b_col = b_matrix_cache[col]
-
-                # C[row,col] = sum(A[row,k] * B[k,col])
-                expected_value = sum(a_row[k] * b_col[k] for k in range(matrix_size))
-
-                # Apply iterations if needed
-                if iterations > 1:
-                    expected_value *= iterations
-
-                claimed_value = coordinate_values[i]
-
-                if self._values_match_with_tolerance(expected_value, claimed_value):
-                    success_count += 1
-
-        success_rate = success_count / len(sampling_coords) if sampling_coords else 1.0
-        cache_efficiency = (
-            len(rows_needed) * len(cols_needed) / (len(rows_needed) + len(cols_needed))
-            if (len(rows_needed) + len(cols_needed)) > 0
-            else 1.0
-        )
-
-        bt.logging.debug(
-            f"Sampling verification: {success_rate:.1%} success rate, cache efficiency: {cache_efficiency:.1f}x"
-        )
-        return success_rate >= self._get_success_rate_threshold()
-
-    async def _verify_row_sampling_coordinates(
-        self,
-        seed_hash: int,
-        matrix_size: int,
-        row_id: int,
-        row_sampling_coords: List[List[int]],
-        coordinate_values: List[float],
-        iterations: int,
-    ) -> bool:
-        """Verify sampling coordinates for a specific row with 95% success rate"""
-        if not row_sampling_coords:
-            return False
-
-        if len(coordinate_values) != len(row_sampling_coords):
-            bt.logging.error(
-                f"Row sampling coordinate values count mismatch: {len(coordinate_values)} values vs {len(row_sampling_coords)} coordinates"
-            )
-            return False
-
-        success_count = 0
-        for i, coord in enumerate(row_sampling_coords):
-            row, col = coord[0], coord[1]
-
-            # Compute expected value
-            expected_value = self._compute_matrix_element_gemm(
-                seed_hash, matrix_size, row, col, iterations
-            )
-            claimed_value = coordinate_values[i]
-
-            if self._values_match_with_tolerance(expected_value, claimed_value):
-                success_count += 1
-
-        success_rate = (
-            success_count / len(row_sampling_coords) if row_sampling_coords else 0.0
-        )
-        return success_rate >= self._get_success_rate_threshold()
-
-    def _compute_matrix_element_gemm(
-        self, seed_hash: int, matrix_size: int, row: int, col: int, iterations: int = 1
-    ) -> float:
-        """Compute single matrix element C[row,col] = sum(A[row,k] * B[k,col])"""
-        if iterations > 1:
-            # Multi-iteration matrix multiplication not properly implemented
-            # Current system assumes iterations=1 only
-            raise NotImplementedError(
-                f"Multi-iteration ({iterations}) matrix multiplication not implemented correctly"
-            )
-
-        result = 0.0
-        for k in range(matrix_size):
-            a_element = self._generate_matrix_element(seed_hash, row, k, 0)  # Matrix A
-            b_element = self._generate_matrix_element(seed_hash, k, col, 1)  # Matrix B
-            result += a_element * b_element
-        return result
-
-    def _compute_matrix_a_row(
-        self, seed_hash: int, matrix_size: int, row: int
-    ) -> List[float]:
-        """Precompute entire A matrix row for caching"""
-        return [
-            self._generate_matrix_element(seed_hash, row, k, 0)
-            for k in range(matrix_size)
-        ]
-
-    def _compute_matrix_b_column(
-        self, seed_hash: int, matrix_size: int, col: int
-    ) -> List[float]:
-        """Precompute entire B matrix column for caching"""
-        return [
-            self._generate_matrix_element(seed_hash, k, col, 1)
-            for k in range(matrix_size)
-        ]
-
-    def _generate_matrix_element(
-        self, seed_hash: int, row: int, col: int, matrix_type: int
-    ) -> float:
-        """Generate matrix element matching GPU algorithm"""
-        element_id = seed_hash ^ (row << 32) ^ (col << 16) ^ matrix_type
-        element_id = element_id & 0xFFFFFFFFFFFFFFFF
-
-        # GPU cutlass_gemm.cu compatible 32-bit hash
-        hash_val = (element_id ^ (element_id >> 32)) & 0xFFFFFFFF
-        hash_val = (hash_val * 0x9E3779B9 + 0x85EBCA6B) & 0xFFFFFFFF
-        hash_val = hash_val ^ (hash_val >> 16)
-        hash_val = (hash_val * 0x85EBCA6B) & 0xFFFFFFFF
-
-        # Convert to [-1, 1] range
-        normalized = (hash_val & 0xFFFF) / 32768.0 - 1.0
-        return normalized
-
-    def _values_match_with_tolerance(self, expected: float, claimed: float) -> bool:
-        """Check if values match within tolerance (FP16/FP64 precision)"""
-        abs_diff = abs(expected - claimed)
-        rel_diff = abs_diff / (abs(expected) + 1e-10)
-
-        return (
-            abs_diff <= self._get_abs_tolerance()
-            or rel_diff <= self._get_rel_tolerance()
-        )
-
-    async def _compute_cpu_matrix_rows(
-        self, seed: bytes, matrix_size: int, row_indices: List[int], iterations: int = 1
-    ) -> List[str]:
-        """
-        Validator independently computes CPU matrix rows for verification
-        Supports multiple iterations matching worker execution
-        """
-        try:
-            import hashlib
-
-            import numpy as np
-
-            from neurons.shared.challenges.cpu_matrix_challenge import \
-                CPUMatrixChallenge
-
-            # Generate matrices with trusted parameters
-            matrix_a, matrix_b = CPUMatrixChallenge._generate_matrices_from_seed(
-                seed, matrix_size
-            )
-
-            # Compute the full result matrix using the same iteration logic as worker
-            if iterations > 1:
-                result = np.dot(matrix_a.astype(np.int64), matrix_b.astype(np.int64))
-                for _ in range(iterations - 1):
-                    result = np.dot(result, matrix_b.astype(np.int64))
-            else:
-                result = np.dot(matrix_a.astype(np.int64), matrix_b.astype(np.int64))
-
-            # Compute expected hash for each requested row from the final result
-            expected_hashes = []
-            for row_idx in row_indices:
-                computed_row = result[row_idx]
-                # Match worker hashing format: SHA-256 hex truncated to 16 chars
-                expected_hash = hashlib.sha256(computed_row.tobytes()).hexdigest()[:16]
-                expected_hashes.append(expected_hash)
-
-            bt.logging.debug(
-                f"Computed {len(expected_hashes)} CPU matrix row hashes (iterations={iterations})"
-            )
-            return expected_hashes
-
-        except Exception as e:
-            bt.logging.error(f"CPU matrix computation failed: {e}")
-            raise RuntimeError(f"Failed to compute expected CPU results: {str(e)}")
-
-    def get_verification_stats(self) -> Dict[str, Any]:
-        """
-        Get verification service statistics
-
-        Returns:
-            Dictionary with service statistics
-        """
-        return {
-            "running": self.running,
-            "concurrent_tasks": self.concurrent_tasks,
-            "verification_interval": self.verification_interval,
-            "coordinate_sample_count": self.coordinate_sample_count,
-            "row_verification_count": self.row_verification_count,
-            "success_rate_threshold": self.success_rate_threshold,
-            "abs_tolerance": self.abs_tolerance,
-            "rel_tolerance": self.rel_tolerance,
-            "random_coordinate_verification_enabled": self.coordinate_sample_count > 0,
-        }
-
     def validate_configuration(self) -> List[str]:
         """
         Validate service configuration and return any issues
@@ -1954,16 +1091,6 @@ class AsyncChallengeVerifier:
         if self.verification_interval < 1:
             issues.append("verification_interval must be at least 1 second")
 
-        # Validate coordinate settings
-        if self.coordinate_sample_count < 0:
-            issues.append(
-                "coordinate_sample_count must be >= 0 (0 disables random verification)"
-            )
-
-        # Allow 0 for row-only-disabled mode; enforce the pairwise constraint below
-        if self.row_verification_count < 0:
-            issues.append("row_verification_count must be >= 0")
-
         # Validate tolerances
         if self.abs_tolerance <= 0:
             issues.append("abs_tolerance must be positive")
@@ -1975,56 +1102,4 @@ class AsyncChallengeVerifier:
         if not (0.5 <= self.success_rate_threshold <= 1.0):
             issues.append("success_rate_threshold must be between 0.5 and 1.0")
 
-        # Check if both coordinate and row verification are disabled
-        if self.coordinate_sample_count == 0 and self.row_verification_count == 0:
-            issues.append(
-                "coordinate_sample_count and row_verification_count cannot both be 0"
-            )
-
         return issues
-
-    async def health_check(self) -> Dict[str, Any]:
-        """
-        Perform a health check of the verification service
-
-        Returns:
-            Health status dictionary
-        """
-        health_status = {
-            "healthy": True,
-            "issues": [],
-            "service_running": self.running,
-            "verification_task_active": self._verification_task is not None
-            and not self._verification_task.done(),
-        }
-
-        # Validate configuration
-        config_issues = self.validate_configuration()
-        if config_issues:
-            health_status["healthy"] = False
-            health_status["issues"].extend(
-                [f"Config: {issue}" for issue in config_issues]
-            )
-
-        # Check database connectivity
-        try:
-            with self.database_manager.get_session() as session:
-                # Simple query to test connectivity
-                pending_challenges = self._get_oldest_verifying_challenges()
-                health_status["database_accessible"] = True
-                health_status["pending_challenges_pending"] = len(pending_challenges)
-        except Exception as e:
-            health_status["healthy"] = False
-            health_status["issues"].append(f"Database: {str(e)}")
-            health_status["database_accessible"] = False
-
-        # Check verification task status
-        if self.running and (
-            not self._verification_task or self._verification_task.done()
-        ):
-            health_status["healthy"] = False
-            health_status["issues"].append(
-                "Verification task not running despite service being started"
-            )
-
-        return health_status

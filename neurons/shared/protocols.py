@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
-    """Strict base model forbidding extras and normalizing strings."""
+    """Strict base model normalizing strings."""
 
     model_config = ConfigDict(
         extra="allow",

@@ -1,6 +1,6 @@
 """
-Worker Performance Ranking System
-Implements global worker ranking and weighted scoring to prevent low-performance spam
+Worker Performance Scoring System
+Implements global worker absolute-performance scoring based on execution time per GPU
 """
 
 import time
@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import bittensor as bt
 
+from neurons.validator.challenge_status import ChallengeStatus
 from neurons.validator.models.database import (ComputeChallenge,
                                                DatabaseManager, WorkerInfo)
 
@@ -24,6 +25,8 @@ class WorkerPerformanceScore:
         lease_score: float = 0.0,
         success_rate: float = 1.0,
         total_attempts: int = 1,
+        total_compute_ms: float = 0.0,
+        success_count_avg: float = 1.0,
     ):
         self.worker_id = worker_id
         self.hotkey = hotkey
@@ -31,24 +34,26 @@ class WorkerPerformanceScore:
         self.lease_score = lease_score
         self.success_rate = success_rate
         self.total_attempts = total_attempts
+        self.total_compute_ms = total_compute_ms
+        self.success_count_avg = success_count_avg
         self.performance_score = 0.0  # Will be calculated by ranker
-        self.global_rank = 0  # Position in global ranking
+        self.order_index = 0  # Position in ordered list (0-based)
 
-        # Two-stage ranking fields
-        self.participation_score = 0.0  # Participation score for ranking
+        # Participation tiering fields
+        self.participation_score = 0.0  # Participation score for ordering
         self.actual_participation = 0  # Actual successful attempts
         self.baseline_expected = 0.0  # Expected baseline for participation
 
 
 class WorkerPerformanceRanker:
     """
-    Global worker performance ranking and scoring system
+    Global worker performance scoring system
 
-    This system implements the core challenge scoring logic:
-    1. Collect all worker challenge results from current evaluation period
-    2. Rank workers globally by performance (execution time)
-    3. Apply weighted scoring to heavily penalize low-performance workers
-    4. Aggregate worker scores to miner-level scores
+    Core logic:
+    1. Collect verified worker challenge results in the evaluation period
+    2. Compute average execution time per GPU for each worker
+    3. Assign worker score = 1 / avg_time_ms (higher = faster)
+    4. Aggregate worker scores to miner-level by summing (cap 100 workers)
     """
 
     def __init__(
@@ -59,19 +64,18 @@ class WorkerPerformanceRanker:
     ):
         self.db_manager = database_manager
         self.performance_cache: Dict[str, WorkerPerformanceScore] = {}
-        self.last_ranking_update = 0.0
+        self.last_update_ts = 0.0
 
-        # Two-stage ranking configuration
+        # Participation configuration
         self.challenge_interval = challenge_interval
         self.participation_rate_threshold = participation_rate_threshold
 
-    def calculate_global_worker_rankings(
+    def calculate_worker_performance(
         self, evaluation_window_minutes: int
     ) -> Dict[str, WorkerPerformanceScore]:
         """
-        Calculate global worker performance rankings using two-stage ranking:
-        1. Participation score based on min(expected_baseline, actual_participation)
-        2. Average execution time within same participation tier
+        Calculate global worker performance metrics using participation tiering for sorting
+        and absolute-performance worker scoring.
 
         Args:
             evaluation_window_minutes: Time window for collecting challenge results
@@ -80,7 +84,7 @@ class WorkerPerformanceRanker:
             Dictionary mapping worker_key to WorkerPerformanceScore
         """
         bt.logging.info(
-            f"Calculating two-stage worker rankings (window: {evaluation_window_minutes}m)"
+            f"Calculating worker performance | window={evaluation_window_minutes}m"
         )
 
         with self.db_manager.get_session() as session:
@@ -97,10 +101,9 @@ class WorkerPerformanceRanker:
             )
 
             bt.logging.info(
-                f"📊 Ranking baseline: {evaluation_window_minutes}min window, "
-                f"{self.challenge_interval}s interval → "
-                f"max {max_possible_challenges:.0f} challenges, "
-                f"{self.participation_rate_threshold:.0%} baseline = {baseline_expected:.1f}"
+                f"📊 Baseline: {evaluation_window_minutes}min window, "
+                f"{self.challenge_interval}s interval → max {max_possible_challenges:.0f} challenges, "
+                f"{self.participation_rate_threshold:.0%} threshold = {baseline_expected:.1f}"
             )
 
             # Get all recent challenges, considering only those that passed two-phase verification
@@ -109,18 +112,38 @@ class WorkerPerformanceRanker:
                 .filter(
                     ComputeChallenge.created_at >= cutoff_time,
                     ComputeChallenge.deleted_at.is_(None),
-                    ComputeChallenge.challenge_status == "verified",
+                    ComputeChallenge.challenge_status == ChallengeStatus.VERIFIED,
                 )
                 .order_by(ComputeChallenge.created_at.desc())
                 .all()
             )
 
             if not all_challenges:
-                bt.logging.warning("No recent challenges found for ranking")
+                bt.logging.warning("No recent challenges found for scoring")
                 return {}
 
             bt.logging.debug(f"Processing {len(all_challenges)} recent challenges")
             worker_stats = {}
+
+            # Build GPU uuid -> canonical hotkey map from inventory
+            uuid_owner_map: Dict[str, str] = {}
+            try:
+                from neurons.validator.models.database import GPUInventory
+
+                gpu_rows = (
+                    session.query(GPUInventory)
+                    .filter(
+                        GPUInventory.deleted_at.is_(None),
+                        GPUInventory.last_seen_at >= cutoff_time,
+                    )
+                    .all()
+                )
+                uuid_owner_map = {r.gpu_uuid: r.hotkey for r in gpu_rows if r.gpu_uuid}
+            except Exception as e:
+                bt.logging.warning(
+                    f"Failed to load GPU inventory for uuid ownership: {e}"
+                )
+                uuid_owner_map = {}
 
             # Statistics collection
             for challenge in all_challenges:
@@ -133,7 +156,32 @@ class WorkerPerformanceRanker:
                         "successful_times": [],
                         "total_attempts": 0,
                         "successful_attempts": 0,
+                        "total_compute_ms": 0.0,
+                        "total_success_count": 0,
                     }
+
+                # Enforce single-hotkey-per-uuid participation for GPU challenges
+                try:
+                    mc = challenge.merkle_commitments or {}
+                    # GPU commitments use real uuids; CPU uses "-1"
+                    gpu_uuids = [
+                        u
+                        for u in (mc.keys() if isinstance(mc, dict) else [])
+                        if u and u != "-1"
+                    ]
+                    if gpu_uuids:
+                        # If any uuid's canonical owner hotkey differs, skip counting this challenge
+                        mismatch = False
+                        for u in gpu_uuids:
+                            owner = uuid_owner_map.get(u)
+                            if owner is not None and owner != challenge.hotkey:
+                                mismatch = True
+                                break
+                        if mismatch:
+                            # Do not count towards participation or performance
+                            continue
+                except Exception:
+                    pass
 
                 worker_stats[worker_key]["total_attempts"] += 1
 
@@ -152,16 +200,23 @@ class WorkerPerformanceRanker:
                     # Calculate normalized time per GPU/processing unit
                     normalized_time = challenge.computation_time_ms / success_count
                     worker_stats[worker_key]["successful_times"].append(normalized_time)
+                    worker_stats[worker_key]["total_compute_ms"] += float(
+                        challenge.computation_time_ms
+                    )
+                    worker_stats[worker_key]["total_success_count"] += int(
+                        success_count
+                    )
+                    # Keep only aggregate counts; last success_count not needed
 
-            # Calculate ranking metrics for each worker
-            workers_for_ranking = []
+            # Calculate metrics and absolute scores for each worker
+            workers_for_ordering = []
             worker_lease_scores = self._get_worker_lease_scores(session)
 
             for worker_key, stats in worker_stats.items():
                 if stats["successful_attempts"] == 0:
                     continue
 
-                # Two-stage ranking metrics
+                # Participation metrics
                 actual_participation = stats["successful_attempts"]
                 participation_score = min(baseline_expected, actual_participation)
 
@@ -170,9 +225,16 @@ class WorkerPerformanceRanker:
                     stats["successful_times"]
                 )
                 success_rate = stats["successful_attempts"] / stats["total_attempts"]
+                total_compute_ms = float(stats.get("total_compute_ms", 0.0))
+                tsc = int(stats.get("total_success_count", 0))
+                success_count_avg = (
+                    (tsc / stats["successful_attempts"])
+                    if stats["successful_attempts"] > 0
+                    else 0.0
+                )
                 lease_score = worker_lease_scores.get(worker_key, 0.0)
 
-                workers_for_ranking.append(
+                workers_for_ordering.append(
                     {
                         "worker_key": worker_key,
                         "hotkey": stats["hotkey"],
@@ -184,22 +246,24 @@ class WorkerPerformanceRanker:
                         "success_rate": success_rate,
                         "lease_score": lease_score,
                         "total_attempts": stats["total_attempts"],
+                        "total_compute_ms": total_compute_ms,
+                        "success_count_avg": success_count_avg,
                     }
                 )
 
-            # Two-stage sorting
-            workers_for_ranking.sort(
+            # Tier sorting (participation tier, then avg execution time)
+            workers_for_ordering.sort(
                 key=lambda x: (
-                    -x["participation_score"],  # Participation score high to low
-                    x["average_time"],  # Average time low to high
+                    -x["participation_score"],  # Higher participation first
+                    x["average_time"],  # Faster first
                 )
             )
 
-            # Generate final rankings and scores
+            # Generate final ordering and scores
             worker_scores = {}
-            total_workers = len(workers_for_ranking)
+            total_workers = len(workers_for_ordering)
 
-            for rank, worker_data in enumerate(workers_for_ranking):
+            for rank, worker_data in enumerate(workers_for_ordering):
                 worker_key = worker_data["worker_key"]
 
                 worker_score = WorkerPerformanceScore(
@@ -209,26 +273,36 @@ class WorkerPerformanceRanker:
                     lease_score=worker_data["lease_score"],
                     success_rate=worker_data["success_rate"],
                     total_attempts=worker_data["total_attempts"],
+                    total_compute_ms=worker_data.get("total_compute_ms", 0.0),
+                    success_count_avg=worker_data.get("success_count_avg", 0.0),
                 )
 
-                # Set ranking fields
-                worker_score.global_rank = rank
+                # Set ordering fields
+                worker_score.order_index = rank
                 worker_score.participation_score = worker_data["participation_score"]
                 worker_score.actual_participation = worker_data["actual_participation"]
                 worker_score.baseline_expected = worker_data["baseline_expected"]
 
-                # Calculate final performance score based on rank
-                worker_score.performance_score = (
-                    self._calculate_weighted_performance_score(rank, total_workers)
+                # Absolute-performance score with participation multiplier
+                base_score = self._calculate_absolute_performance_score(
+                    worker_score.execution_time_ms
                 )
+                be = worker_score.baseline_expected
+                ap = worker_score.actual_participation
+                participation_coeff = (
+                    1.0
+                    if (be is None or be <= 0)
+                    else min(1.0, (ap / be) if be > 0 else 1.0)
+                )
+                worker_score.performance_score = base_score * participation_coeff
 
                 worker_scores[worker_key] = worker_score
 
             self.performance_cache = worker_scores
-            self.last_ranking_update = time.time()
+            self.last_update_ts = time.time()
 
             # Logging results
-            self._log_ranking_summary(worker_scores, evaluation_window_minutes)
+            self._log_performance_summary(worker_scores, evaluation_window_minutes)
 
             return worker_scores
 
@@ -238,14 +312,11 @@ class WorkerPerformanceRanker:
         """
         Aggregate worker performance scores to miner-level challenge scores
 
-        Leased workers (lease_score > 0.0) receive perfect score (1.0) without participating in challenges.
         Unleased workers receive scores based on actual challenge performance.
-
-        Formula: sum(unleased_worker_scores) + sum(leased_worker_perfect_scores)
-        More workers = higher miner score
+        Formula: sum(top 100 worker absolute scores)
 
         Args:
-            ranked_workers: Global worker rankings from calculate_global_worker_rankings()
+            ranked_workers: Worker performance map from calculate_worker_performance()
 
         Returns:
             Dictionary mapping miner hotkey to challenge score (raw sum, not normalized)
@@ -264,40 +335,13 @@ class WorkerPerformanceRanker:
         # Calculate final miner challenge scores
         miner_challenge_scores = {}
 
-        with self.db_manager.get_session() as session:
-            # Get leased worker counts by miner
-            leased_worker_counts = self._get_leased_worker_counts_by_miner(session)
-
-            # Ensure miners with only leased workers are included
-            all_miners = set(miner_scores.keys()) | set(leased_worker_counts.keys())
-
-            for hotkey in all_miners:
-                worker_scores = miner_scores.get(hotkey, [])
-
-                # Cap unleased contributions at 100 workers
-                top_worker_scores = sorted(worker_scores, reverse=True)[:100]
-
-                # Add perfect scores for leased workers within remaining slots
-                leased_count = leased_worker_counts.get(hotkey, 0)
-                available_slots = max(0, 100 - len(top_worker_scores))
-                leased_workers_to_count = min(leased_count, available_slots)
-
-                # Sum unleased performance + leased perfect scores
-                unleased_score = sum(top_worker_scores)
-                leased_score = leased_workers_to_count * 1.0
-                total_score = unleased_score + leased_score
-
-                miner_challenge_scores[hotkey] = total_score
-
-                if leased_count > 0 and len(worker_scores) == 0:
-                    bt.logging.debug(
-                        f"Miner {hotkey}: 0 unleased + {leased_workers_to_count} leased → challenge score {total_score:.2f}"
-                    )
-                elif leased_count > 0:
-                    bt.logging.debug(
-                        f"Miner {hotkey}: {len(top_worker_scores)} unleased (score: {unleased_score:.2f}) + "
-                        f"{leased_workers_to_count} leased (score: {leased_score:.2f}), total: {total_score:.2f}"
-                    )
+        # Sum absolute scores per miner with a cap of 100 workers
+        all_miners = set(miner_scores.keys())
+        for hotkey in all_miners:
+            worker_scores = miner_scores.get(hotkey, [])
+            top_worker_scores = sorted(worker_scores, reverse=True)[:100]
+            total_score = sum(top_worker_scores)
+            miner_challenge_scores[hotkey] = total_score
 
         bt.logging.debug(
             f"Calculated challenge scores for {len(miner_challenge_scores)} miners"
@@ -324,54 +368,32 @@ class WorkerPerformanceRanker:
 
         return len(worker_scores), worker_scores
 
-    def _calculate_weighted_performance_score(
-        self, rank: int, total_workers: int
-    ) -> float:
+    # Removed legacy rank-based scoring function
+
+    def _calculate_absolute_performance_score(self, average_time_ms: float) -> float:
         """
-        Calculate weighted performance score based on ranking coefficient algorithm
+        Absolute-performance worker score based on inverse of average execution time per GPU.
 
-        Uses a continuous ranking coefficient formula to maintain score diversity
-        while still heavily penalizing low-performance workers to prevent spam attacks
-
-        Args:
-            rank: Worker's rank (0 = best performer)
-            total_workers: Total number of workers being ranked
-
-        Returns:
-            Performance score between 0.02 and 1.0
+        Higher score means faster worker. Zero time yields zero score.
         """
-        if total_workers <= 0:
+        try:
+            t = float(average_time_ms)
+            if t <= 0 or not (t < float("inf")):
+                return 0.0
+            return 1.0 / t
+        except Exception:
             return 0.0
 
-        # Calculate ranking coefficient
-        ranking_coeff = rank / (total_workers - 1) if total_workers > 1 else 0.0
-
-        # Apply exponential decay with ranking coefficient to create continuous scoring
-        # Exponential decay maintains heavy penalties for low performers
-
-        max_score = 1.0
-        min_score = 0.02  # Minimal "basic income" for worst performers
-        decay_factor = 3.5  # Controls how aggressively scores drop
-        power = 1.8  # Controls the curve shape
-
-        # Calculate exponential decay score
-        import math
-
-        raw_score = max_score * math.exp(-decay_factor * (ranking_coeff**power))
-
-        # Ensure minimum score and cap at maximum
-        score = max(min_score, min(max_score, raw_score))
-
-        return score
-
-    def _log_ranking_summary(
+    def _log_performance_summary(
         self, worker_scores: Dict[str, WorkerPerformanceScore], window_minutes: int
     ):
-        """Log summary of two-stage ranking results"""
+        """Log summary of performance results"""
         if not worker_scores:
             return
 
-        bt.logging.debug(f"Two-stage ranking completed | workers={len(worker_scores)}")
+        bt.logging.debug(
+            f"Performance scoring completed | workers={len(worker_scores)}"
+        )
 
         # Group by participation score for analysis
         participation_groups = {}
@@ -392,7 +414,7 @@ class WorkerPerformanceRanker:
                     score.actual_participation / score.baseline_expected * 100
                 )
                 bt.logging.info(
-                    f"  #{score.global_rank+1} {worker_key}: "
+                    f"  #{score.order_index+1} {worker_key}: "
                     f"{score.actual_participation} challenges ({completion_rate:.1f}%), "
                     f"{score.execution_time_ms:.1f}ms avg, SR:{score.success_rate:.1%}"
                 )
@@ -435,12 +457,12 @@ class WorkerPerformanceRanker:
 
         return {hotkey: count for hotkey, count in leased_worker_counts}
 
-    def get_ranking_statistics(self) -> Dict[str, Any]:
-        """Get statistics about current rankings"""
+    def get_performance_statistics(self) -> Dict[str, Any]:
+        """Get statistics about current performance cache"""
         if not self.performance_cache:
             return {
                 "total_workers": 0,
-                "last_update": self.last_ranking_update,
+                "last_update": self.last_update_ts,
                 "score_distribution": {},
             }
 
@@ -457,7 +479,7 @@ class WorkerPerformanceRanker:
 
         return {
             "total_workers": len(self.performance_cache),
-            "last_update": self.last_ranking_update,
+            "last_update": self.last_update_ts,
             "score_distribution": score_ranges,
             "execution_time_range_ms": {
                 "min": min(execution_times) if execution_times else 0,

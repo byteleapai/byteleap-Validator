@@ -81,7 +81,7 @@ class ProofProcessor(SynapseProcessor):
 
                 if not challenge:
                     return {"error": f"Challenge {challenge_id} not found"}, 1
-                if challenge.challenge_status != "committed":
+                if challenge.challenge_status != ChallengeStatus.COMMITTED:
                     return {
                         "error": f"Challenge {challenge_id} not in committed state"
                     }, 1
@@ -100,14 +100,20 @@ class ProofProcessor(SynapseProcessor):
                 verified_proofs = self._filter_verified_proofs(challenge, proofs)
                 proof_data_dict = self._serialize_proof_data(verified_proofs)
 
+                # Require worker_id to key cache per-worker
+                worker_id = challenge.worker_id
+                if not worker_id:
+                    return {"error": "Challenge missing worker_id for proof storage"}, 1
+
                 # Store in LRU cache and handle evictions
                 cache_data = {
                     "proofs": proof_data_dict,
                     "received_at": datetime.utcnow().isoformat(),
                     "challenge_id": challenge_id,
                 }
+                cache_key = f"{peer_hotkey}:{worker_id}"
                 evicted_challenge_ids = self.proof_cache.store_proof(
-                    peer_hotkey, cache_data
+                    cache_key, cache_data
                 )
 
                 # Mark evicted challenges as failed
@@ -135,25 +141,6 @@ class ProofProcessor(SynapseProcessor):
                 # Store debug info if available
                 if proof_data.debug_info:
                     challenge.debug_info = proof_data.debug_info
-
-                # Audit log: Check for timing manipulation attempts
-                if (
-                    proofs
-                    and hasattr(proofs[0], "computation_time_ms")
-                    and proofs[0].computation_time_ms
-                ):
-                    server_time_ms = (
-                        challenge.computed_at - challenge.sent_at
-                    ).total_seconds() * 1000
-                    reported_time_ms = proofs[0].computation_time_ms
-                    if (
-                        abs(server_time_ms - reported_time_ms) > server_time_ms * 0.1
-                    ):  # >10% difference
-                        bt.logging.warning(
-                            f"🚨 SECURITY: Timing discrepancy detected for {challenge.hotkey} "
-                            f"worker {challenge.worker_id}: server={server_time_ms:.1f}ms, "
-                            f"reported={reported_time_ms:.1f}ms (ignored)"
-                        )
 
                 # Mark as verifying for async verification
                 challenge.computed_at = datetime.utcnow()

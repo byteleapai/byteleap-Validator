@@ -296,6 +296,7 @@ class MinerValidationService:
                     pending_challenges = (
                         session.query(ComputeChallenge)
                         .filter(
+                            ComputeChallenge.hotkey == miner.hotkey,
                             ComputeChallenge.worker_id == worker.worker_id,
                             ComputeChallenge.challenge_status.in_(
                                 [ChallengeStatus.CREATED, ChallengeStatus.VERIFYING]
@@ -577,7 +578,7 @@ class MinerValidationService:
                     if miner.last_challenge_time
                     else None
                 ),
-                "is_valid": True,  # Two-stage ranking replaces success rate validation
+                "is_valid": True,  # Participation baseline with absolute scoring
             }
 
     def get_validation_status(self) -> Dict[str, Any]:

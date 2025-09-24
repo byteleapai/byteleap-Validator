@@ -379,7 +379,7 @@ class NetworkWeight(Base):
 
     # Weight information
     weight_value = Column(Float, nullable=False)
-    calculation_remark = Column(String(256))
+    calculation_remark = Column(Text)
     apply_remark = Column(String(256))
 
     # Calculation basis
@@ -1308,6 +1308,7 @@ class DatabaseManager:
         expired_challenges = (
             session.query(ComputeChallenge)
             .filter(
+                ComputeChallenge.verification_result.is_(None),
                 ComputeChallenge.expires_at < now,
                 ComputeChallenge.computed_at.is_(None),
                 ComputeChallenge.deleted_at.is_(None),

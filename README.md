@@ -31,7 +31,7 @@ The validator manages a dual-factor scoring system for network participants:
 - Two-phase verification prevents cheating:
   - Phase 1: Workers commit to results (merkle root)
   - Phase 2: Validators verify through random sampling
-- Scoring uses participation baseline + performance ranking
+- Scoring uses participation baseline + absolute performance scoring
 - Rewards consistent participation over peak performance
 
 **Worker Management**
@@ -57,12 +57,8 @@ source ./venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Modify the relevant parameters of wallet
-cd config
-cp validator_config.yaml.example validator_config.yaml
-
 # Setup PostgreSQL database, skip this if you use sqlite (default config)
-(cp scripts/setup_database.sh /tmp; cd /tmp; sudo -u postgres /tmp/setup_database.sh setup)
+# (cp scripts/setup_database.sh /tmp; cd /tmp; sudo -u postgres /tmp/setup_database.sh setup)
 ```
 
 ### Configuration

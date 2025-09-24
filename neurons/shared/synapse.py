@@ -11,21 +11,6 @@ import bittensor as bt
 class SynapseHandler:
     """Handles synapse validation and processing"""
 
-    def validate_synapse(self, synapse: Any) -> bool:
-        """
-        Validate synapse has encrypted request data
-
-        Args:
-            synapse: Synapse to validate
-
-        Returns:
-            True if synapse has encrypted request
-        """
-        if not getattr(synapse, "request", None):
-            bt.logging.error("⚠️ Synapse missing request data")
-            return False
-        return True
-
     def get_peer_address(self, synapse: Any) -> str:
         """
         Extract peer address from synapse

@@ -526,8 +526,6 @@ class Validator:
 
         try:
 
-            self.database_manager.create_tables()
-
             self._cleanup_interrupted_challenges()
 
             await self._check_expired_data_on_startup()

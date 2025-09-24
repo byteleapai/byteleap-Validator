@@ -171,11 +171,14 @@ def drop_database(db_config: dict, force: bool = False) -> bool:
         return False
 
 
-def run_alembic_command(command: list, database_url: str) -> bool:
+def run_alembic_command(
+    command: list, database_url: str, config_path: str = None
+) -> bool:
     """Run Alembic command"""
     try:
         env = os.environ.copy()
-        env["DATABASE_URL"] = database_url
+        if config_path:
+            env["VALIDATOR_CONFIG_PATH"] = config_path
 
         os.chdir(project_root)
         result = subprocess.run(
@@ -197,7 +200,7 @@ def run_alembic_command(command: list, database_url: str) -> bool:
         return False
 
 
-def init_migrations(database_url: str) -> bool:
+def init_migrations(database_url: str, config_path: str = None) -> bool:
     """Initialize migrations"""
     bt.logging.info("Initializing database migrations...")
 
@@ -207,47 +210,53 @@ def init_migrations(database_url: str) -> bool:
         bt.logging.info(
             "Migrations already initialized, skipping initial migration creation"
         )
-        return run_alembic_command(["upgrade", "head"], database_url)
+        return run_alembic_command(["upgrade", "head"], database_url, config_path)
 
     # Create initial migration
     success = run_alembic_command(
-        ["revision", "--autogenerate", "-m", "Initial migration"], database_url
+        ["revision", "--autogenerate", "-m", "Initial migration"],
+        database_url,
+        config_path,
     )
     if success:
-        return run_alembic_command(["upgrade", "head"], database_url)
+        return run_alembic_command(["upgrade", "head"], database_url, config_path)
     return False
 
 
-def create_migration(message: str, database_url: str) -> bool:
+def create_migration(message: str, database_url: str, config_path: str = None) -> bool:
     """Create new migration"""
     bt.logging.info(f"Creating migration: {message}")
     return run_alembic_command(
-        ["revision", "--autogenerate", "-m", message], database_url
+        ["revision", "--autogenerate", "-m", message], database_url, config_path
     )
 
 
-def upgrade_database(database_url: str, revision: str = "head") -> bool:
+def upgrade_database(
+    database_url: str, revision: str = "head", config_path: str = None
+) -> bool:
     """Upgrade database"""
     bt.logging.info(f"Upgrading database to version: {revision}")
-    return run_alembic_command(["upgrade", revision], database_url)
+    return run_alembic_command(["upgrade", revision], database_url, config_path)
 
 
-def downgrade_database(database_url: str, revision: str) -> bool:
+def downgrade_database(
+    database_url: str, revision: str, config_path: str = None
+) -> bool:
     """Downgrade database"""
     bt.logging.info(f"Downgrading database to version: {revision}")
-    return run_alembic_command(["downgrade", revision], database_url)
+    return run_alembic_command(["downgrade", revision], database_url, config_path)
 
 
-def show_migration_history(database_url: str) -> bool:
+def show_migration_history(database_url: str, config_path: str = None) -> bool:
     """Show migration history"""
     bt.logging.info("Migration history:")
-    return run_alembic_command(["history"], database_url)
+    return run_alembic_command(["history"], database_url, config_path)
 
 
-def show_current_revision(database_url: str) -> bool:
+def show_current_revision(database_url: str, config_path: str = None) -> bool:
     """Show current version"""
     bt.logging.info("Current database version:")
-    return run_alembic_command(["current"], database_url)
+    return run_alembic_command(["current"], database_url, config_path)
 
 
 def main():
@@ -255,7 +264,6 @@ def main():
     parser = argparse.ArgumentParser(description="Database migration management tool")
 
     parser.add_argument("--config", type=str, help="Configuration file path")
-    parser.add_argument("--database-url", type=str, help="Database connection URL")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -301,23 +309,22 @@ def main():
         return
 
     # Get database configuration
-    if args.database_url:
-        database_url = args.database_url
-    else:
-        db_config_dict = load_database_config(args.config)
-        database_url = db_config_dict.get(
-            "url", "postgresql://neurons:PrygvMv3U5KjBEKtye7S@localhost:5432/neurons"
-        )
+    db_config_dict = load_database_config(args.config)
+    if "url" not in db_config_dict or not db_config_dict["url"]:
+        bt.logging.error("❌ Missing database.url in configuration file")
+        sys.exit(1)
+    database_url = db_config_dict["url"]
 
     bt.logging.info(
         f"Using database URL: {database_url.split('@')[-1] if '@' in database_url else database_url}"
     )
 
-    # Parse database configuration
-    db_config = parse_database_url(database_url)
-
     # Execute command
     if args.command == "check":
+        if not database_url.startswith("postgresql://"):
+            bt.logging.error("❌ 'check' only supports PostgreSQL URLs")
+            sys.exit(1)
+        db_config = parse_database_url(database_url)
         if not check_postgresql_connection(db_config):
             sys.exit(1)
 
@@ -327,6 +334,10 @@ def main():
             bt.logging.warning(f"✗ Database '{db_config['database']}' does not exist")
 
     elif args.command == "create-db":
+        if not database_url.startswith("postgresql://"):
+            bt.logging.error("❌ 'create-db' only supports PostgreSQL URLs")
+            sys.exit(1)
+        db_config = parse_database_url(database_url)
         if not check_postgresql_connection(db_config):
             sys.exit(1)
 
@@ -337,6 +348,10 @@ def main():
                 sys.exit(1)
 
     elif args.command == "drop-db":
+        if not database_url.startswith("postgresql://"):
+            bt.logging.error("❌ 'drop-db' only supports PostgreSQL URLs")
+            sys.exit(1)
+        db_config = parse_database_url(database_url)
         if not check_postgresql_connection(db_config):
             sys.exit(1)
 
@@ -347,31 +362,33 @@ def main():
             bt.logging.warning(f"Database '{db_config['database']}' does not exist")
 
     elif args.command == "init":
-        if not database_exists(db_config):
-            if not create_database(db_config):
-                sys.exit(1)
+        if database_url.startswith("postgresql://"):
+            db_config = parse_database_url(database_url)
+            if not database_exists(db_config):
+                if not create_database(db_config):
+                    sys.exit(1)
 
-        if not init_migrations(database_url):
+        if not init_migrations(database_url, args.config):
             sys.exit(1)
 
     elif args.command == "create":
-        if not create_migration(args.message, database_url):
+        if not create_migration(args.message, database_url, args.config):
             sys.exit(1)
 
     elif args.command == "upgrade":
-        if not upgrade_database(database_url, args.revision):
+        if not upgrade_database(database_url, args.revision, args.config):
             sys.exit(1)
 
     elif args.command == "downgrade":
-        if not downgrade_database(database_url, args.revision):
+        if not downgrade_database(database_url, args.revision, args.config):
             sys.exit(1)
 
     elif args.command == "history":
-        if not show_migration_history(database_url):
+        if not show_migration_history(database_url, args.config):
             sys.exit(1)
 
     elif args.command == "current":
-        if not show_current_revision(database_url):
+        if not show_current_revision(database_url, args.config):
             sys.exit(1)
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Standalone Update Checker
-Can be run independently for update checks without PM2 restart
+Can be run independently for update checks; restart policy is caller-defined.
 """
 
 import asyncio
@@ -25,9 +25,7 @@ async def main():
 
         if update_performed:
             print("🎉 Update completed successfully!")
-            print("📝 IMPORTANT: Manual PM2 restart required to use new code")
-            print("📝 Run: pm2 restart subnet-validator")
-            print("📝 Or use: python3 scripts/pm2_manager.py restart")
+            print("📝 IMPORTANT: Restart the validator process to use the new code")
         else:
             print("✅ No updates needed - already up to date")
 

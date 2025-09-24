@@ -1,24 +1,12 @@
-"""
-MeshHub WebSocket Client
-Establishes an authenticated, encrypted session with MeshHub and processes inbound messages.
-
-Scope:
-- Handshake using hotkey + access token
-- Lease score broadcast -> apply to local DB
-- Config update -> in-memory merge (validation, weight_management)
-- Task publish -> persist to meshhub_tasks and ACK
-
-Notes:
-- Encryption uses CryptoManager with deterministic IV and AAD binding
-- Auto-reconnect with fixed delay from config
-"""
+"""MeshHub WebSocket Client"""
 
 import asyncio
 import base64
+import hashlib
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -27,6 +15,10 @@ import bittensor as bt
 from neurons.shared.config.config_manager import ConfigManager
 from neurons.shared.crypto import CryptoManager
 from neurons.validator.models.database import DatabaseManager
+
+# Network/performance batching limits
+SCORE_REPORT_BATCH_SIZE = 100  # workerScores per SCORE_REPORT
+RESOURCE_REPORT_MAX_WORKERS = 100  # workers per RESOURCE_REPORT batch (across miners)
 
 
 @dataclass
@@ -128,6 +120,15 @@ class MeshHubClient:
         self._client_version = self._load_client_version()
         self._on_fatal = on_fatal
         # No outbound error correlation state (handled by MeshHub)
+
+        # Incremental resource reporting state
+        # Per-worker last hashes: state and hardware
+        self._worker_state_hash: Dict[str, str] = {}
+        self._worker_hw_hash: Dict[str, str] = {}
+        # Last successful resource report time (UTC)
+        self._last_resource_report_utc: Optional[datetime] = None
+        # Whether we have sent an initial full snapshot in this process
+        self._initial_resource_full_sent: bool = False
 
     def _now_ms(self) -> int:
         """Wall-clock epoch milliseconds in UTC."""
@@ -644,11 +645,91 @@ class MeshHubClient:
         while not self._stop.is_set():
             try:
                 if self.session:
-                    payload = self._build_resource_snapshot()
-                    await self._send_encrypted_ws("MESH_RESOURCE_REPORT_V1", payload)
+                    # Full on first run, then delta
+                    full_mode = not self._initial_resource_full_sent
+                    payload, changed, pending_updates = self._build_resource_report(
+                        full=full_mode
+                    )
+                    if payload:
+                        miners = payload.get("miners") or []
+                        mode = payload.get("mode") or ("full" if full_mode else "delta")
+                        since_iso = payload.get("since")
+
+                        if miners:
+                            for miners_batch in self._chunk_miners_by_workers(
+                                miners, RESOURCE_REPORT_MAX_WORKERS
+                            ):
+                                batched_payload = {"miners": miners_batch, "mode": mode}
+                                if since_iso:
+                                    batched_payload["since"] = since_iso
+                                await self._send_encrypted_ws(
+                                    "MESH_RESOURCE_REPORT_V1", batched_payload
+                                )
+                        # Apply pending worker hash updates only after send attempt
+                        try:
+                            for wk_key, h in (
+                                pending_updates.get("workers") or {}
+                            ).items():
+                                if "state" in h:
+                                    self._worker_state_hash[wk_key] = h["state"]
+                                if "hardware" in h and h["hardware"] is not None:
+                                    self._worker_hw_hash[wk_key] = h["hardware"]
+                        except Exception:
+                            pass
+
+                        # Mark full sent and update watermark after a send attempt
+                        if full_mode:
+                            self._initial_resource_full_sent = True
+                        try:
+                            self._last_resource_report_utc = datetime.utcnow()
+                        except Exception:
+                            self._last_resource_report_utc = None
             except Exception:
                 pass
             await asyncio.sleep(max(5, self.resource_report_interval))
+
+    def _chunk_miners_by_workers(
+        self, miners: List[Dict[str, Any]], max_workers: int
+    ) -> List[List[Dict[str, Any]]]:
+        """Split miners array into batches with at most max_workers workers total per batch.
+
+        Each batch contains miner entries with a subset of their workers.
+        Miners without workers are omitted to reduce bandwidth.
+        """
+        batches: List[List[Dict[str, Any]]] = []
+        current_batch: List[Dict[str, Any]] = []
+        current_count = 0
+
+        for miner in miners:
+            workers = list(miner.get("workers") or [])
+            if not workers:
+                continue
+
+            i = 0
+            while i < len(workers):
+                remaining = max_workers - current_count
+                take = min(remaining, len(workers) - i)
+                slice_workers = workers[i : i + take]
+
+                miner_entry = {
+                    "hotkey": miner.get("hotkey"),
+                    "status": miner.get("status"),
+                    "version": miner.get("version"),
+                    "workers": slice_workers,
+                }
+                current_batch.append(miner_entry)
+                current_count += take
+                i += take
+
+                if current_count >= max_workers:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_count = 0
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
 
     def _build_heartbeat_payload(self) -> Dict[str, Any]:
         now_ms = int(asyncio.get_event_loop().time() * 1000)
@@ -658,9 +739,12 @@ class MeshHubClient:
         active_workers = 0
         total_tasks = 0
         success_tasks = 0
+        pending_verifications = 0
 
         try:
-            from neurons.validator.models.database import (MeshHubTask,
+            from neurons.validator.challenge_status import ChallengeStatus
+            from neurons.validator.models.database import (ComputeChallenge,
+                                                           MeshHubTask,
                                                            MinerInfo,
                                                            WorkerInfo)
 
@@ -702,6 +786,16 @@ class MeshHubClient:
 
                 total_tasks = q_total.count()
                 success_tasks = q_success.count()
+
+                # Pending verification queue size (VERIFYING)
+                pending_verifications = (
+                    session.query(ComputeChallenge)
+                    .filter(
+                        ComputeChallenge.challenge_status == ChallengeStatus.VERIFYING,
+                        ComputeChallenge.deleted_at.is_(None),
+                    )
+                    .count()
+                )
         except Exception:
             # Keep heartbeat resilient to DB issues
             pass
@@ -716,6 +810,7 @@ class MeshHubClient:
             "activeMiners": int(active_miners),
             "totalTasks": int(total_tasks),
             "successRate": float(success_rate),
+            "pendingVerifications": int(pending_verifications),
         }
 
         return {
@@ -724,21 +819,157 @@ class MeshHubClient:
             "statistics": stats,
         }
 
-    def _build_resource_snapshot(self) -> Dict[str, Any]:
+    def _stable_hash(self, obj: Any) -> str:
         try:
-            from neurons.validator.models.database import (GPUInventory,
-                                                           HardwareInfo,
-                                                           HeartbeatRecord,
-                                                           MinerInfo,
-                                                           WorkerInfo)
+            data = json.dumps(
+                obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        except Exception:
+            data = str(obj)
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
-            miners: List[Dict[str, Any]] = []
+    def _build_worker_payload(
+        self,
+        session,
+        w,
+        include_hardware: bool,
+    ) -> Dict[str, Any]:
+        from neurons.validator.models.database import (GPUInventory,
+                                                       HardwareInfo,
+                                                       HeartbeatRecord)
+
+        hw = (
+            session.query(HardwareInfo)
+            .filter(
+                HardwareInfo.hotkey == w.hotkey,
+                HardwareInfo.worker_id == w.worker_id,
+                HardwareInfo.deleted_at.is_(None),
+            )
+            .first()
+        )
+        gpus = (
+            session.query(GPUInventory)
+            .filter(
+                GPUInventory.hotkey == w.hotkey,
+                GPUInventory.worker_id == w.worker_id,
+                GPUInventory.deleted_at.is_(None),
+            )
+            .all()
+        )
+
+        gpu_list = [g.gpu_info for g in gpus if g.gpu_info is not None]
+        hardware_full = {
+            "cpu": (hw.cpu_info if hw and hw.cpu_info is not None else {}),
+            "memory": (hw.memory_info if hw and hw.memory_info is not None else {}),
+            "storage": (hw.storage_info if hw and hw.storage_info is not None else []),
+            "gpus": gpu_list,
+            "mb_info": (
+                hw.motherboard_info if hw and hw.motherboard_info is not None else {}
+            ),
+        }
+
+        # Latest utilization from most recent heartbeat
+        avg_cpu = None
+        avg_mem = None
+        public_ip = None
+        try:
+            last_hb = (
+                session.query(HeartbeatRecord)
+                .filter(
+                    HeartbeatRecord.hotkey == w.hotkey,
+                    HeartbeatRecord.worker_id == w.worker_id,
+                    HeartbeatRecord.deleted_at.is_(None),
+                )
+                .order_by(HeartbeatRecord.created_at.desc())
+                .first()
+            )
+            if last_hb is not None:
+                avg_cpu = (
+                    float(last_hb.cpu_usage) if last_hb.cpu_usage is not None else None
+                )
+                avg_mem = (
+                    float(last_hb.memory_usage)
+                    if last_hb.memory_usage is not None
+                    else None
+                )
+                public_ip = last_hb.public_ip
+        except Exception:
+            pass
+
+        net_obj: Dict[str, Any] = {}
+        if public_ip:
+            net_obj["public_ip"] = public_ip
+
+        payload: Dict[str, Any] = {
+            "workerKey": f"{w.hotkey}:{w.worker_id}",
+            "workerId": w.worker_id,
+            "workerName": (w.worker_name or None),
+            "status": "ACTIVE" if w.is_online else "OFFLINE",
+            "version": w.worker_version or None,
+            "capabilities": w.capabilities or [],
+            "leaseScore": w.lease_score or 0.0,
+            "lastSeenAt": self._to_iso_utc(w.last_heartbeat),
+            # stats and uptime are lightweight, always include
+            "stats": {
+                "avg_cpu_usage": avg_cpu,
+                "avg_memory_usage": avg_mem,
+                "avg_storage_usage": None,
+            },
+            # Uptime comes from worker hardware record
+            "uptimeSeconds": (
+                int(hw.uptime_seconds) if hw and hw.uptime_seconds else None
+            ),
+            # Network object handled same as os_info: include object as-is
+            "network": net_obj,
+            "os_info": (hw.system_info if hw and hw.system_info is not None else {}),
+        }
+        if include_hardware:
+            payload["hardware"] = hardware_full
+        return payload
+
+    def _build_worker_hashes(self, worker_payload: Dict[str, Any]) -> Dict[str, str]:
+        # Build separate hashes for state and hardware
+        state_basis = {
+            "workerName": worker_payload.get("workerName"),
+            "status": worker_payload.get("status"),
+            "version": worker_payload.get("version"),
+            "capabilities": sorted(worker_payload.get("capabilities") or []),
+            "stats": worker_payload.get("stats") or {},
+            "uptimeSeconds": worker_payload.get("uptimeSeconds"),
+            "network": worker_payload.get("network") or {},
+        }
+        hw_obj = worker_payload.get("hardware")
+        # When hardware is not present in payload, we compute hash from empty
+        hw_basis = hw_obj if isinstance(hw_obj, dict) else {}
+        return {
+            "state": self._stable_hash(state_basis),
+            "hardware": self._stable_hash(hw_basis),
+        }
+
+    def _build_resource_report(
+        self, full: bool
+    ) -> (Dict[str, Any], bool, Dict[str, Any]):
+        """Build resource report payload.
+
+        Returns (payload, changed). For delta mode, changed=False means no diffs found.
+        """
+        try:
+            from neurons.validator.models.database import MinerInfo, WorkerInfo
+
+            miners_out: List[Dict[str, Any]] = []
+            changed_any = False
+            pending_updates: Dict[str, Any] = {"workers": {}}
+            since_iso = (
+                self._to_iso_utc(self._last_resource_report_utc) if not full else None
+            )
+
             with self.db.get_session() as session:
                 miner_rows = (
                     session.query(MinerInfo)
                     .filter(MinerInfo.deleted_at.is_(None))
                     .all()
                 )
+
                 for m in miner_rows:
                     workers = (
                         session.query(WorkerInfo)
@@ -748,124 +979,72 @@ class MeshHubClient:
                         )
                         .all()
                     )
+
                     worker_list: List[Dict[str, Any]] = []
                     for w in workers:
-                        hw = (
-                            session.query(HardwareInfo)
-                            .filter(
-                                HardwareInfo.hotkey == w.hotkey,
-                                HardwareInfo.worker_id == w.worker_id,
-                                HardwareInfo.deleted_at.is_(None),
-                            )
-                            .first()
-                        )
-                        gpus = (
-                            session.query(GPUInventory)
-                            .filter(
-                                GPUInventory.hotkey == w.hotkey,
-                                GPUInventory.worker_id == w.worker_id,
-                                GPUInventory.deleted_at.is_(None),
-                            )
-                            .all()
-                        )
-                        # Full hardware info mapping required by MeshHub integration
-                        gpu_list = [g.gpu_info for g in gpus if g.gpu_info is not None]
-                        hardware = {
-                            "cpu": (
-                                hw.cpu_info if hw and hw.cpu_info is not None else {}
-                            ),
-                            "memory": (
-                                hw.memory_info
-                                if hw and hw.memory_info is not None
-                                else {}
-                            ),
-                            "storage": (
-                                hw.storage_info
-                                if hw and hw.storage_info is not None
-                                else []
-                            ),
-                            "gpus": gpu_list,
-                            "mb_info": (
-                                hw.motherboard_info
-                                if hw and hw.motherboard_info is not None
-                                else {}
-                            ),
-                        }
-                        # Latest utilization stats from the most recent heartbeat record
-                        avg_cpu = None
-                        avg_mem = None
-                        try:
-                            last_hb = (
-                                session.query(HeartbeatRecord)
-                                .filter(
-                                    HeartbeatRecord.hotkey == w.hotkey,
-                                    HeartbeatRecord.worker_id == w.worker_id,
-                                    HeartbeatRecord.deleted_at.is_(None),
-                                )
-                                .order_by(HeartbeatRecord.created_at.desc())
-                                .first()
-                            )
-                            if last_hb is not None:
-                                avg_cpu = (
-                                    float(last_hb.cpu_usage)
-                                    if last_hb.cpu_usage is not None
-                                    else None
-                                )
-                                avg_mem = (
-                                    float(last_hb.memory_usage)
-                                    if last_hb.memory_usage is not None
-                                    else None
-                                )
-                        except Exception:
-                            pass
+                        wk_key = f"{w.hotkey}:{w.worker_id}"
 
-                        worker_list.append(
-                            {
-                                "workerKey": f"{w.hotkey}:{w.worker_id}",
-                                "workerId": w.worker_id,
-                                # MeshHub expects uppercase enums: ACTIVE|INACTIVE|BUSY|MAINTENANCE|OFFLINE|UNKNOWN
-                                "status": "ACTIVE" if w.is_online else "OFFLINE",
-                                # Preserve actual worker version if available
-                                "version": w.worker_version or None,
-                                "capabilities": w.capabilities or [],
-                                "leaseScore": w.lease_score or 0.0,
-                                "lastSeenAt": self._to_iso_utc(w.last_heartbeat),
-                                "hardware": hardware,
-                                # Average utilization stats (rolling averages from hardware table)
-                                "stats": {
-                                    "avg_cpu_usage": avg_cpu,
-                                    "avg_memory_usage": avg_mem,
-                                    "avg_storage_usage": None,
-                                },
-                                "uptimeSeconds": (
-                                    int(hw.uptime_seconds)
-                                    if hw and hw.uptime_seconds
-                                    else None
-                                ),
-                                # Network details not reported for now
-                                "network": {},
-                                # OS/system info as reported by worker
-                                "os_info": (
-                                    hw.system_info
-                                    if hw and hw.system_info is not None
-                                    else {}
-                                ),
+                        # For delta: compute both state and hardware hashes to decide inclusion
+                        # Build full worker payload first, but we may omit hardware for delta when unchanged
+                        # First, build with hardware to compute hw hash
+                        full_payload = self._build_worker_payload(
+                            session,
+                            w,
+                            include_hardware=True,
+                        )
+                        hashes = self._build_worker_hashes(full_payload)
+                        state_changed = hashes["state"] != self._worker_state_hash.get(
+                            wk_key
+                        )
+                        hw_changed = hashes["hardware"] != self._worker_hw_hash.get(
+                            wk_key
+                        )
+
+                        if full or state_changed or hw_changed:
+                            # For delta, omit hardware if it hasn't changed to reduce payload size
+                            include_hw = full or hw_changed
+                            if include_hw:
+                                worker_payload = full_payload
+                            else:
+                                worker_payload = self._build_worker_payload(
+                                    session,
+                                    w,
+                                    include_hardware=False,
+                                )
+                            worker_list.append(worker_payload)
+                            # Queue hash updates to apply after successful send
+                            pending_updates["workers"][wk_key] = {
+                                "state": hashes["state"],
+                                "hardware": hashes["hardware"] if include_hw else None,
                             }
-                        )
 
-                    miners.append(
+                    # Always include miner record when sending (full or delta)
+                    # For delta, miner may have empty workers list if no worker changed
+                    miners_out.append(
                         {
                             "hotkey": m.hotkey,
-                            # MeshHub expects uppercase enums: ACTIVE|INACTIVE|UNKNOWN|OFFLINE
                             "status": "ACTIVE" if m.is_online else "OFFLINE",
-                            # Report miner software version if recorded
                             "version": m.miner_version or None,
                             "workers": worker_list,
                         }
                     )
-            return {"miners": miners}
-        except Exception:
-            return {"miners": []}
+                    # Only worker changes determine whether to send delta
+                    changed_any = changed_any or bool(worker_list)
+
+            payload: Dict[str, Any] = {
+                "miners": miners_out,
+                "mode": "full" if full else "delta",
+            }
+            if since_iso:
+                payload["since"] = since_iso
+            return payload, changed_any, pending_updates
+        except Exception as e:
+            bt.logging.error(f"❌ Build resource report failed | error={e}")
+            return (
+                {"miners": [], "mode": "delta" if not full else "full"},
+                False,
+                {"workers": {}},
+            )
 
     def _load_client_version(self) -> str:
         """Load project version from version.txt at repository root."""
@@ -877,193 +1056,31 @@ class MeshHubClient:
         except Exception:
             return "unknown"
 
-    def _build_score_report(
-        self, effective_at_iso: Optional[str] = None
-    ) -> Dict[str, Any]:
-        try:
-            from datetime import datetime, timedelta
-
-            from neurons.validator.models.database import (HeartbeatRecord,
-                                                           MinerInfo,
-                                                           WorkerInfo)
-            from neurons.validator.services.worker_performance_ranker import \
-                WorkerPerformanceRanker
-
-            window_min = int(self.config.get("validation.ranking_window_minutes"))
-            challenge_interval = int(self.config.get("validation.challenge_interval"))
-            pr_threshold = float(
-                self.config.get("validation.participation_rate_threshold")
-            )
-            lease_w = float(
-                self.config.get("weight_management.score_weights.lease_weight")
-            )
-            chall_w = float(
-                self.config.get("weight_management.score_weights.challenge_weight")
-            )
-
-            ranker = WorkerPerformanceRanker(self.db, challenge_interval, pr_threshold)
-            ranked_workers = ranker.calculate_global_worker_rankings(window_min)
-            miner_challenge_raw = ranker.calculate_miner_challenge_scores(
-                ranked_workers
-            )
-            max_raw = max(miner_challenge_raw.values()) if miner_challenge_raw else 0.0
-            total_ranked = len(ranked_workers)
-
-            def _miner_lease_score(session, hotkey: str) -> float:
-
-                workers = (
-                    session.query(WorkerInfo)
-                    .filter(
-                        WorkerInfo.hotkey == hotkey,
-                        WorkerInfo.deleted_at.is_(None),
-                    )
-                    .all()
-                )
-                if not workers:
-                    return 0.0
-                total = sum(w.lease_score or 0.0 for w in workers)
-                max_workers = min(100, len(workers))
-                return min(1.0, (total / max_workers) if max_workers > 0 else 0.0)
-
-            def _availability_score(session, hotkey: str) -> float:
-
-                window_start = datetime.utcnow() - timedelta(hours=169)
-                records = (
-                    session.query(HeartbeatRecord)
-                    .filter(
-                        HeartbeatRecord.hotkey == hotkey,
-                        HeartbeatRecord.created_at >= window_start,
-                    )
-                    .order_by(HeartbeatRecord.created_at.asc())
-                    .all()
-                )
-                if not records:
-                    return 0.0
-                expected = 169 * 12
-                intervals = set(int(r.created_at.timestamp() // 300) for r in records)
-                return min(1.0, len(intervals) / expected) if expected > 0 else 0.0
-
-            worker_scores: List[Dict[str, Any]] = []
-
-            with self.db.get_session() as session:
-                miners = (
-                    session.query(MinerInfo)
-                    .filter(MinerInfo.deleted_at.is_(None))
-                    .all()
-                )
-
-                for m in miners:
-                    workers = (
-                        session.query(WorkerInfo)
-                        .filter(
-                            WorkerInfo.hotkey == m.hotkey,
-                            WorkerInfo.deleted_at.is_(None),
-                        )
-                        .all()
-                    )
-
-                    for w in workers:
-                        wk_key = f"{w.hotkey}_{w.worker_id}"
-                        ws = ranked_workers.get(wk_key)
-
-                        is_leased = (w.lease_score or 0.0) > 0.0
-                        perf_score = (
-                            1.0
-                            if is_leased
-                            else ((ws.performance_score if ws else 0.0))
-                        )
-                        rank = (ws.global_rank + 1) if ws else None
-                        factors = {
-                            "windowMinutes": window_min,
-                            "leaseScore": float(w.lease_score or 0.0),
-                            "isLeased": is_leased,
-                            "avgExecMs": float(
-                                (
-                                    ws.execution_time_ms
-                                    if ws
-                                    else (w.avg_task_time_ms or 0.0)
-                                )
-                                or 0.0
-                            ),
-                            "successRate": float(ws.success_rate if ws else 0.0),
-                            "participationScore": float(
-                                ws.participation_score if ws else 0.0
-                            ),
-                            "actualParticipation": int(
-                                ws.actual_participation if ws else 0
-                            ),
-                            "baselineExpected": float(
-                                ((window_min * 60) / challenge_interval) * pr_threshold
-                            ),
-                            "rank": int(rank) if rank is not None else None,
-                            "rankTotal": total_ranked,
-                            "performanceScore": float(perf_score),
-                        }
-                        worker_scores.append(
-                            {
-                                "workerKey": f"{w.hotkey}:{w.worker_id}",
-                                "score": round(perf_score, 4),
-                                "factors": factors,
-                                "timestamp": self._utc_now_iso(),
-                            }
-                        )
-
-                    lease_score = _miner_lease_score(session, m.hotkey)
-                    raw_challenge = float(miner_challenge_raw.get(m.hotkey, 0.0))
-                    challenge_norm = (
-                        min(1.0, raw_challenge / max_raw) if max_raw > 0 else 0.0
-                    )
-                    availability = _availability_score(session, m.hotkey)
-                    composite = lease_score * lease_w + challenge_norm * chall_w
-                    final_score = composite * availability
-
-                    leased_count = sum(
-                        1 for w in workers if (w.lease_score or 0.0) > 0.0
-                    )
-                    unleased_count = max(0, len(workers) - leased_count)
-                    miner_factors = {
-                        "windowMinutes": window_min,
-                        "leaseWeight": lease_w,
-                        "challengeWeight": chall_w,
-                        "leaseScore": float(lease_score),
-                        "challengeRaw": float(raw_challenge),
-                        "challengeNorm": float(challenge_norm),
-                        "availabilityScore": float(availability),
-                        "compositeScore": float(composite),
-                        "minerWorkerCount": len(workers),
-                        "leasedWorkerCount": leased_count,
-                        "unleasedWorkerCount": unleased_count,
-                        "rankedWorkerCount": total_ranked,
-                    }
-                    worker_scores.append(
-                        {
-                            "workerKey": f"{m.hotkey}:-1",
-                            "score": round(final_score, 4),
-                            "factors": miner_factors,
-                            "timestamp": self._utc_now_iso(),
-                        }
-                    )
-
-            payload: Dict[str, Any] = {
-                "workerScores": worker_scores,
-                "timestamp": self._utc_now_iso(),
-                "version": "1.0",
-            }
-            if effective_at_iso:
-                payload["effectiveAt"] = effective_at_iso
-            return payload
-        except Exception as e:
-            bt.logging.error(f"❌ Build score report failed | error={e}")
-            return {
-                "workerScores": [],
-                "timestamp": self._utc_now_iso(),
-                "version": "1.0",
-            }
-
-    async def publish_score_report(self, effective_at: Optional[str] = None) -> None:
+    async def publish_score_report(
+        self,
+        effective_at: Optional[str] = None,
+        worker_scores: Optional[List[Dict[str, Any]]] = None,
+        global_stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Publish a score report on demand (event-driven)."""
         if not self.session:
             return
-        payload = self._build_score_report(effective_at_iso=effective_at)
-        if payload.get("workerScores"):
+        if not worker_scores:
+            return
+
+        total = len(worker_scores)
+        sent = 0
+        while sent < total:
+            chunk = worker_scores[sent : sent + SCORE_REPORT_BATCH_SIZE]
+            payload: Dict[str, Any] = {
+                "workerScores": chunk,
+                "timestamp": self._utc_now_iso(),
+                "version": "1.0",
+            }
+            if effective_at:
+                payload["effectiveAt"] = effective_at
+            if global_stats:
+                payload["globalStats"] = global_stats
+
             await self._send_encrypted_ws("MESH_SCORE_REPORT_V1", payload)
+            sent += len(chunk)

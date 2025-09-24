@@ -8,6 +8,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,10 @@ sys.path.insert(0, str(project_root))
 
 from neurons.shared.config.config_manager import ConfigManager
 from neurons.validator.core.validator import Validator
+from neurons.validator.services.database_migrator import \
+    migrate_to_head_if_needed
 from neurons.validator.services.meshhub_client import MeshHubClient
+from scripts.auto_updater import AutoUpdater, UpdateScheduler
 
 
 def load_config(config_path: str) -> ConfigManager:
@@ -55,6 +59,12 @@ def create_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Only validate configuration without starting service",
+    )
+
+    parser.add_argument(
+        "--no-auto-update",
+        action="store_true",
+        help="Skip automatic update check during startup",
     )
 
     return parser
@@ -167,7 +177,7 @@ def setup_logging(config: ConfigManager) -> None:
     # Get the root logger used by bittensor
     root_logger = logging.getLogger()
 
-    # Create rotating file handler (daily rotation, keep 30 days)
+    # Create rotating file handler (daily rotation, keep 3 days)
     log_filename = "validator.log"
     log_filepath = Path(log_dir) / log_filename
 
@@ -175,7 +185,7 @@ def setup_logging(config: ConfigManager) -> None:
         filename=log_filepath,
         when="midnight",
         interval=1,
-        backupCount=30,
+        backupCount=3,
         encoding="utf-8",
         utc=False,
     )
@@ -207,6 +217,14 @@ def setup_logging(config: ConfigManager) -> None:
     websockets_logger = logging.getLogger("websockets")
     websockets_logger.setLevel(logging.WARNING)
 
+    # Suppress verbose SQLAlchemy internals unless explicitly needed
+    logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.orm").setLevel(logging.WARNING)
+    # Alembic migration logs at INFO are usually sufficient
+    logging.getLogger("alembic").setLevel(logging.INFO)
+
     bt.logging.info(f"🧾 File logging | path={log_filepath} | level={log_level}")
 
 
@@ -234,6 +252,116 @@ def check_database_connection(database_url: str) -> bool:
 
     except Exception as e:
         bt.logging.error(f"❌ Database connection failed | error={e}")
+        return False
+
+
+async def perform_startup_update_check() -> bool:
+    """
+    Perform automatic update check during validator startup
+
+    Returns:
+        bool: True if an update was performed and restart is needed, False otherwise
+    """
+    try:
+        bt.logging.info("🔍 Performing startup update check")
+
+        # Check if we just restarted due to an update (prevent infinite loops)
+        restart_marker_file = project_root / ".update_restart_marker"
+        if restart_marker_file.exists():
+            bt.logging.info("✅ Validator restarted successfully after update")
+            # Remove the marker file
+            restart_marker_file.unlink()
+            return False
+
+        # Create auto-updater instance
+        updater = AutoUpdater(str(project_root))
+
+        # Get current version before update check
+        current_version = updater.get_current_version()
+
+        # Perform update check
+        update_performed = await updater.check_and_update()
+
+        if update_performed:
+            bt.logging.info("🎉 Update completed successfully!")
+            bt.logging.info("📝 IMPORTANT: Restarting to use new code")
+
+            # Create marker file to indicate we're restarting due to update
+            restart_marker_file.write_text(
+                f"Updated from {current_version} at {datetime.now().isoformat()}"
+            )
+
+            updater.cleanup_old_backups()
+            return True
+        else:
+            bt.logging.info("✅ No updates needed - already up to date")
+            updater.cleanup_old_backups()
+            return False
+
+    except Exception as e:
+        bt.logging.warning(
+            f"⚠️ Startup update check failed (continuing with current version): {e}"
+        )
+        return False
+
+
+def restart_validator_process():
+    """
+    Restart the validator process using subprocess in the current terminal
+    This function will exec a new process replacing the current one
+    """
+    try:
+        bt.logging.info("🔄 Restarting validator process with updated code")
+
+        # Get current command line arguments
+        current_args = sys.argv.copy()
+
+        # Construct the restart command
+        python_executable = sys.executable
+        script_path = os.path.abspath(current_args[0])
+        script_args = current_args[1:]
+
+        restart_command = [python_executable, script_path] + script_args
+
+        bt.logging.info(
+            f"🚀 Restarting in current terminal: {' '.join(restart_command)}"
+        )
+        bt.logging.info(f"📁 Working directory: {project_root}")
+        bt.logging.info(f"🐍 Python executable: {python_executable}")
+
+        # Flush all logs before restart
+        import logging
+
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        # Small delay to ensure logs are written
+        import time
+
+        time.sleep(1)
+
+        # Use os.execv to replace current process (Unix/Linux style restart)
+        if hasattr(os, "execv"):
+            bt.logging.info("🔄 Using os.execv to restart process")
+            # Change to project directory
+            os.chdir(str(project_root))
+            # Replace current process with new one
+            os.execv(python_executable, restart_command)
+        else:
+            # Fallback for Windows or systems without execv
+            bt.logging.info("🔄 Using subprocess.call for restart")
+            os.chdir(str(project_root))
+            # Exit current process and start new one
+            exit_code = subprocess.call(restart_command)
+            sys.exit(exit_code)
+
+    except Exception as e:
+        bt.logging.error(f"❌ Failed to restart validator process: {e}")
+        bt.logging.error("📝 Please restart manually to use updated code")
+        # Continue with current process if restart fails
+        bt.logging.warning(
+            "⚠️ Continuing with current process (updated code will be used on next manual restart)"
+        )
         return False
 
 
@@ -284,6 +412,33 @@ async def main():
         bt.logging.info("✅ Config validation done (dry run)")
         return
 
+    # Perform startup update check (unless disabled)
+    update_check_enabled = config.get_optional(
+        "auto_update.enabled", True
+    )  # Default to enabled
+    if not args.no_auto_update and update_check_enabled:
+        bt.logging.info("🚀 Starting automatic update check")
+        update_performed = await perform_startup_update_check()
+
+        if update_performed:
+            bt.logging.info("🔄 Update completed - restarting validator with new code")
+            # Restart the current process via Python native exec (no external manager required)
+            restart_validator_process()
+            # This line should never be reached due to os.execv in restart_validator_process()
+            return
+    else:
+        if args.no_auto_update:
+            bt.logging.info("⏭️ Automatic updates disabled via command line")
+        else:
+            bt.logging.info("⏭️ Automatic updates disabled in configuration")
+
+    # Ensure database schema is up-to-date before service starts
+    bt.logging.info("🛠️ Ensuring database schema is current")
+    ok = migrate_to_head_if_needed(database_url, config_path=args.config)
+    if not ok:
+        bt.logging.error("❌ Database migration failed; aborting startup")
+        sys.exit(1)
+
     validator = None
     try:
         # Create unified Bittensor config to avoid multiple internal loads
@@ -324,7 +479,13 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Unix/Linux event loop policy (default)
+    # Ensure predictable multiprocessing behavior across platforms
+    try:
+        import multiprocessing as mp
+
+        mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
 
     # Run main program
     asyncio.run(main())

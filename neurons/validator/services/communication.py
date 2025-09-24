@@ -327,6 +327,13 @@ class ValidatorCommunicationService:
                             "error": result.error_message,
                             "error_code": error_code,
                         }
+                    else:
+                        if (
+                            response_data
+                            and isinstance(response_data, dict)
+                            and "error" in response_data
+                        ):
+                            result.error_message = response_data.get("error")
 
             except (IntegrityError, OperationalError, DatabaseError) as e:
                 result.error_code = ErrorCodes.DB_ERROR

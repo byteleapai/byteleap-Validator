@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Auto-Updater for Subnet Miner
-Checks for new releases on GitHub and automatically updates the codebase
-Preserves config directory but does NOT restart PM2 automatically
+Checks for new releases on GitHub and automatically updates the codebase.
+Preserves the config directory; restart behavior is up to the caller.
 """
 
 import asyncio
@@ -25,7 +25,7 @@ import aiohttp
 
 
 class AutoUpdater:
-    """Handles automatic updates for the subnet miner without PM2 restart"""
+    """Handles automatic updates for the subnet miner (no process manager dependency)."""
 
     def __init__(self, project_root: str):
         self.project_root = Path(project_root)
@@ -347,7 +347,7 @@ class AutoUpdater:
                 self.logger.warning(f"⚠️ Cleanup failed for {path}: {e}")
 
     async def check_and_update(self) -> bool:
-        """Main update check and execution logic (without PM2 restart)"""
+        """Main update check and execution logic (caller controls restart)."""
         try:
             self.logger.info("🔍 Starting update check")
 
@@ -415,18 +415,12 @@ class AutoUpdater:
             # Cleanup
             self.cleanup_temp_files(temp_zip)
 
-            # Important: Do NOT restart PM2 automatically
+            # Caller decides whether to restart (e.g., run_validator.py auto-restarts)
             self.logger.info(
                 f"🎉 Update completed successfully to version {latest_version}"
             )
             self.logger.info(
-                "📝 IMPORTANT: Code updated but PM2 restart required manually"
-            )
-            self.logger.info(
-                "📝 Run 'pm2 restart subnet-validator' to use the new code"
-            )
-            self.logger.info(
-                "📝 Or use the PM2 manager: python3 scripts/pm2_manager.py restart"
+                "📝 If the caller does not auto-restart, please restart the process to apply the new code"
             )
 
             return True
@@ -479,8 +473,9 @@ class UpdateScheduler:
             self.logger.info("⏰ Scheduled update check started")
             update_performed = await self.updater.check_and_update()
             if update_performed:
-                self.logger.info("🎉 Update completed - manual PM2 restart required")
-                self.logger.info("📝 Run: pm2 restart subnet-validator")
+                self.logger.info(
+                    "🎉 Update completed - restart the process to apply changes (caller-defined)"
+                )
             self.updater.cleanup_old_backups()
             self.last_check_time = time.time()
         except Exception as e:
@@ -494,7 +489,7 @@ class UpdateScheduler:
             if update_performed:
                 self.logger.info("🎉 Initial update completed")
                 self.logger.info(
-                    "📝 NOTICE: Manual PM2 restart required to use new code"
+                    "📝 NOTICE: Caller should restart process to apply new code"
                 )
             self.updater.cleanup_old_backups()
             self.last_check_time = time.time()

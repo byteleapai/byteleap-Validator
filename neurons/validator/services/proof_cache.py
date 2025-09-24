@@ -6,19 +6,22 @@ import bittensor as bt
 
 
 class LRUProofCache:
-    """Thread-safe LRU cache for challenge proof data with fixed capacity"""
+    """Thread-safe LRU cache for challenge proof data with fixed capacity
+
+    Keyed by a per-worker cache key (e.g., "{hotkey}:{worker_id}").
+    """
 
     def __init__(self, max_size: int = 1000):
         self.max_size = max_size
         self._cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._lock = threading.RLock()
 
-    def store_proof(self, hotkey: str, proof_data: Dict[str, Any]) -> List[str]:
+    def store_proof(self, cache_key: str, proof_data: Dict[str, Any]) -> List[str]:
         """
-        Store proof data for a hotkey, returning list of evicted challenge_ids
+        Store proof data for a worker cache key, returning list of evicted challenge_ids
 
         Args:
-            hotkey: The hotkey to store proof for
+            cache_key: The cache key (e.g., "{hotkey}:{worker_id}")
             proof_data: The proof data to store
 
         Returns:
@@ -27,64 +30,64 @@ class LRUProofCache:
         evicted_challenge_ids = []
 
         with self._lock:
-            # If key exists, remove it first to update position
-            if hotkey in self._cache:
-                del self._cache[hotkey]
+            # If key exists, remove it first to update position (keep latest per worker)
+            if cache_key in self._cache:
+                del self._cache[cache_key]
 
             # Check capacity and evict if necessary
             while len(self._cache) >= self.max_size:
                 # Evict least recently used (first item)
-                evicted_hotkey, evicted_data = self._cache.popitem(last=False)
+                evicted_key, evicted_data = self._cache.popitem(last=False)
                 evicted_challenge_id = evicted_data.get("challenge_id")
                 if evicted_challenge_id:
                     evicted_challenge_ids.append(evicted_challenge_id)
                     bt.logging.debug(
-                        f"cache evicted | hotkey={evicted_hotkey[:8]}... challenge_id={evicted_challenge_id}"
+                        f"cache evicted | key={evicted_key[:12]}... challenge_id={evicted_challenge_id}"
                     )
 
             # Store new data (will be added at end - most recently used)
-            self._cache[hotkey] = proof_data
+            self._cache[cache_key] = proof_data
 
         bt.logging.debug(
-            f"proof stored | hotkey={hotkey[:8]}... cache_size={len(self._cache)}"
+            f"proof stored | key={cache_key[:12]}... cache_size={len(self._cache)}"
         )
 
         return evicted_challenge_ids
 
-    def get_proof(self, hotkey: str) -> Optional[Dict[str, Any]]:
+    def get_proof(self, cache_key: str) -> Optional[Dict[str, Any]]:
         """
-        Retrieve proof data for a hotkey and mark as recently used
+        Retrieve proof data for a worker cache key and mark as recently used
 
         Args:
-            hotkey: The hotkey to retrieve proof for
+            cache_key: The cache key (e.g., "{hotkey}:{worker_id}")
 
         Returns:
             Proof data if found, None otherwise
         """
         with self._lock:
-            if hotkey not in self._cache:
+            if cache_key not in self._cache:
                 return None
 
             # Move to end (mark as most recently used)
-            proof_data = self._cache[hotkey]
-            self._cache.move_to_end(hotkey)
+            proof_data = self._cache[cache_key]
+            self._cache.move_to_end(cache_key)
 
             return proof_data
 
-    def remove_proof(self, hotkey: str) -> bool:
+    def remove_proof(self, cache_key: str) -> bool:
         """
-        Remove proof data for a hotkey
+        Remove proof data for a worker cache key
 
         Args:
-            hotkey: The hotkey to remove proof for
+            cache_key: The cache key (e.g., "{hotkey}:{worker_id}")
 
         Returns:
             True if removed, False if not found
         """
         with self._lock:
-            if hotkey in self._cache:
-                del self._cache[hotkey]
-                bt.logging.debug(f"proof removed | hotkey={hotkey[:8]}...")
+            if cache_key in self._cache:
+                del self._cache[cache_key]
+                bt.logging.debug(f"proof removed | key={cache_key[:12]}...")
                 return True
             return False
 

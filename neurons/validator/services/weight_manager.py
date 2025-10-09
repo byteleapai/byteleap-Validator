@@ -33,12 +33,14 @@ class WeightManager:
         metagraph: bt.metagraph,
         config: ConfigManager,
         meshhub_client=None,
+        metagraph_cache=None,
     ):
         """Initialize weight manager"""
         self.db_manager = database_manager
         self.wallet = wallet
         self.subtensor = subtensor
         self.metagraph = metagraph
+        self.metagraph_cache = metagraph_cache
         self.config = config
         self.meshhub_client = meshhub_client
 
@@ -57,6 +59,9 @@ class WeightManager:
             config.get_positive_number("validation.challenge_interval", int),
             config.get_range(
                 "validation.participation_rate_threshold", 0.1, 1.0, float
+            ),
+            availability_window_hours=config.get_positive_number(
+                "weight_management.availability.window_hours", int
             ),
         )
 
@@ -103,18 +108,6 @@ class WeightManager:
         while self.is_running:
             try:
                 bt.logging.info("🧮 Weight calc cycle start")
-
-                try:
-                    async with self._subtensor_lock:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(
-                            None, lambda: self.metagraph.sync(subtensor=self.subtensor)
-                        )
-                        bt.logging.debug("Metagraph synced")
-                except Exception as e:
-                    bt.logging.error(
-                        f"⚠️ Metagraph sync error | error={e} using_cached_metagraph"
-                    )
 
                 await self._update_worker_online_status()
 
@@ -222,20 +215,33 @@ class WeightManager:
             return 0
 
     async def _should_set_weights(self) -> bool:
-        """
-        Check if weight submission conditions are met based on chain tempo.
+        """Check if weight submission conditions are met based on chain tempo.
+
+        Behavior:
+        - metagraph.weight_update_tempo > 0: submit when blocks_since_last_update >= tempo
+        - metagraph.weight_update_tempo == 0: submission disabled
         """
         try:
+            tempo_val = self.config.get("metagraph.weight_update_tempo")
+            if not isinstance(tempo_val, int):
+                raise ValueError(
+                    f"metagraph.weight_update_tempo must be int, got {type(tempo_val).__name__}: {tempo_val}"
+                )
 
-            tempo = self.config.get_positive_number(
-                "metagraph.weight_update_tempo", int
-            )
+            if tempo_val == 0:
+                bt.logging.info("⏸️ Weight submission disabled | tempo=0")
+                return False
+
+            if tempo_val < 0:
+                raise ValueError(
+                    f"metagraph.weight_update_tempo must be >= 0, got {tempo_val}"
+                )
+
             last_update_blocks = await self.get_last_update_blocks()
-
-            should_submit = last_update_blocks >= tempo
+            should_submit = last_update_blocks >= int(tempo_val)
 
             bt.logging.debug(
-                f"⏱️ Weights check | tempo={tempo} last={last_update_blocks} submit={should_submit}"
+                f"⏱️ Weights check | tempo={tempo_val} last={last_update_blocks} submit={should_submit}"
             )
 
             return should_submit
@@ -251,7 +257,11 @@ class WeightManager:
         """
         with self.db_manager.get_session() as session:
 
-            active_hotkeys = self.metagraph.hotkeys
+            # Read active hotkeys from cache snapshot
+            if self.metagraph_cache is not None:
+                active_hotkeys = self.metagraph_cache.get_hotkeys()
+            else:
+                active_hotkeys = self.metagraph.hotkeys
             if not active_hotkeys:
                 return []
 
@@ -323,7 +333,9 @@ class WeightManager:
                 bt.logging.warning("⚠️ No valid weights to submit")
 
     def _get_uid_for_hotkey(self, hotkey: str) -> Optional[int]:
-        """Get UID for a given hotkey from metagraph."""
+        """Get UID for a given hotkey from cached metagraph snapshot."""
+        if self.metagraph_cache is not None:
+            return self.metagraph_cache.get_uid(hotkey)
         try:
             if hotkey in self.metagraph.hotkeys:
                 return self.metagraph.hotkeys.index(hotkey)
@@ -401,15 +413,43 @@ class WeightManager:
             bt.logging.error(f"❌ Online status update error | error={e}")
 
     async def _calculate_all_weights(self) -> None:
-        """Calculates and stores pending weights for all active miners."""
+        """Calculates and stores pending weights in a worker thread; event loop only publishes."""
         if not self.is_running:
             return
+
+        loop = asyncio.get_event_loop()
+        try:
+            payload = await loop.run_in_executor(None, self._calculate_all_weights_sync)
+        except Exception as e:
+            bt.logging.error(f"❌ Weight calc (thread) error | error={e}")
+            return
+
+        # Send to MeshHub once per cycle (non-blocking)
+        try:
+            if self.meshhub_client and (
+                payload.get("workerScores") or payload.get("minerScores")
+            ):
+                await self.meshhub_client.publish_score_report(
+                    worker_scores=payload.get("workerScores"),
+                    miner_scores=payload.get("minerScores"),
+                    global_stats=payload.get("globalStats"),
+                )
+        except Exception as e:
+            bt.logging.warning(f"⚠️ Score report publish failed | error={e}")
+
+    def _calculate_all_weights_sync(self) -> Dict[str, Any]:
+        """Synchronous heavy path: DB scan, rank, weight calc, DB write, payload build."""
+        out: Dict[str, Any] = {
+            "workerScores": [],
+            "minerScores": [],
+            "globalStats": None,
+        }
 
         with self.db_manager.get_session() as session:
             active_hotkeys = self.metagraph.hotkeys
             if not active_hotkeys:
                 bt.logging.warning("⚠️ No active miners for scoring")
-                return
+                return out
 
             active_miners = (
                 session.query(MinerInfo)
@@ -437,6 +477,22 @@ class WeightManager:
             worker_rankings = self.performance_ranker.calculate_worker_performance(
                 evaluation_window_minutes=eval_window
             )
+
+            # Compute per-miner average worker availability for reference only
+            miner_avg_availability: Dict[str, float] = {}
+            try:
+                tmp: Dict[str, List[float]] = defaultdict(list)
+                for ws in worker_rankings.values():
+                    hk = getattr(ws, "hotkey", None)
+                    av = float(getattr(ws, "availability", 0.0) or 0.0)
+                    if isinstance(hk, str):
+                        tmp[hk].append(max(0.0, min(1.0, av)))
+                for hk, vals in tmp.items():
+                    miner_avg_availability[hk] = (
+                        sum(vals) / float(len(vals)) if vals else 0.0
+                    )
+            except Exception:
+                miner_avg_availability = {}
 
             miner_challenge_scores = (
                 self.performance_ranker.calculate_miner_challenge_scores(
@@ -468,7 +524,10 @@ class WeightManager:
 
             for miner in active_miners:
                 score, score_details = self._calculate_miner_score(
-                    miner, challenge_norm_map, avg_challenge_norm
+                    miner,
+                    challenge_norm_map,
+                    avg_challenge_norm,
+                    miner_avg_availability,
                 )
                 # Store only primitive hotkey to avoid detached ORM access outside session
                 miner_scores.append(
@@ -482,8 +541,8 @@ class WeightManager:
             weights = self._calculate_weights_from_scores(miner_scores)
 
             # Build MeshHub workerScores (worker-level only) and global stats for this cycle
-
             worker_scores_payload: List[Dict[str, Any]] = []
+            miner_scores_payload: List[Dict[str, Any]] = []
             global_stats_payload: Optional[Dict[str, Any]] = None
             try:
                 try:
@@ -509,19 +568,22 @@ class WeightManager:
                         if max_worker_perf > 0
                         else 0.0
                     )
+                    avail = float(getattr(ws, "availability", 0.0) or 0.0)
                     worker_scores_payload.append(
                         {
                             "workerKey": f"{ws.hotkey}:{ws.worker_id}",
                             "score": round(norm, 6),
+                            "leaseScore": float(ws.lease_score or 0.0),
+                            "perfScore": round(norm, 6),
                             "factors": {
-                                "participationBaselineCount": float(be),
-                                "participationValidCount": int(ap),
+                                "availability": round(max(0.0, min(1.0, avail)), 6),
+                                "participationBaseline": float(be),
+                                "participationCount": int(ap),
                                 "avgExecMs": float(ws.execution_time_ms or 0.0),
                                 "avgExecGpus": float(
                                     getattr(ws, "success_count_avg", 0.0) or 0.0
                                 ),
                                 "rawPerfScore": perf,
-                                "leaseScore": float(ws.lease_score or 0.0),
                             },
                             "calculatedAt": timestamp_iso,
                         }
@@ -547,14 +609,26 @@ class WeightManager:
                 global_stats_payload = {
                     "totalWorkers": len(worker_scores_payload),
                     "averageScore": round(avg_score, 6),
+                    "averageChallengeNorm": round(float(avg_challenge_norm), 6),
                     "windowStart": window_start_iso,
                     "windowEnd": window_end_iso,
                     "participationThreshold": float(pr_threshold),
                     "workerCap": int(CHALLENGE_SCORE_CAP),
                 }
+
+                # Build minerScores payload for all miners
+                for ms in miner_scores:
+                    hk = ms["hotkey"]
+                    miner_scores_payload.append(
+                        {
+                            "hotkey": hk,
+                            "weight": round(float(weights.get(hk, 0.0) or 0.0), 6),
+                        }
+                    )
             except Exception as e:
                 bt.logging.warning(f"⚠️ Build MeshHub score payload failed | error={e}")
                 worker_scores_payload = []
+                miner_scores_payload = []
                 global_stats_payload = None
 
             worker_factors_by_miner: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -586,21 +660,18 @@ class WeightManager:
                     is_applied=False,
                 )
 
-            # Send to MeshHub once per cycle
-            try:
-                if self.meshhub_client and worker_scores_payload:
-                    await self.meshhub_client.publish_score_report(
-                        worker_scores=worker_scores_payload,
-                        global_stats=global_stats_payload,
-                    )
-            except Exception as e:
-                bt.logging.warning(f"⚠️ Score report publish failed | error={e}")
+            out["workerScores"] = worker_scores_payload
+            out["minerScores"] = miner_scores_payload
+            out["globalStats"] = global_stats_payload
+
+        return out
 
     def _calculate_miner_score(
         self,
         miner: MinerInfo,
         challenge_norm_map: Dict[str, float],
         avg_challenge_norm: float,
+        miner_avg_availability: Optional[Dict[str, float]] = None,
     ) -> Tuple[float, Dict[str, float]]:
         """Calculate miner score.
 
@@ -661,13 +732,14 @@ class WeightManager:
             scores["challenge_score"] * chall_w + scores["lease_score"] * lease_w
         )
         scores["composite_score"] = composite_score
+        try:
+            scores["availability_score"] = float(
+                (miner_avg_availability or {}).get(miner.hotkey, 0.0)
+            )
+        except Exception:
+            scores["availability_score"] = 0.0
 
-        availability_score = self._calculate_online_weight_from_heartbeats(miner)
-        scores["availability_score"] = availability_score
-
-        total_score = composite_score * availability_score
-
-        return total_score, scores
+        return composite_score, scores
 
     def _calculate_cpu_matrix_challenge_score(
         self, miner: MinerInfo, miner_challenge_scores: Dict[str, float]
@@ -762,19 +834,24 @@ class WeightManager:
 
             online_ratio = min(1.0, actual_online_intervals / expected_intervals)
 
-            # 169h window: each change halves the score
+            # 169h window: penalize per-worker IP changes only
+            # For each worker_id, count transitions when its IP changes across records in time order.
             ip_changes = 0
-            last_ip = None
+            last_ip_by_worker: Dict[str, Optional[str]] = {}
             for record in heartbeat_records:
+                wid = getattr(record, "worker_id", None)
+                if not wid:
+                    # Skip records without worker association to avoid cross-worker penalties
+                    continue
                 ip = getattr(record, "public_ip", None)
                 if not ip:
                     continue
-                if last_ip is None:
-                    last_ip = ip
-                    continue
-                if ip != last_ip:
+                prev = last_ip_by_worker.get(wid)
+                if prev is None:
+                    last_ip_by_worker[wid] = ip
+                elif ip != prev:
                     ip_changes += 1
-                    last_ip = ip
+                    last_ip_by_worker[wid] = ip
 
             if ip_changes > 0:
                 # Each IP change halves the accumulated availability
@@ -916,66 +993,3 @@ class WeightManager:
             },
             "netuid": self.netuid,
         }
-
-    def get_miner_weight_info(self, hotkey: str) -> Dict[str, Any]:
-        """Get specific miner's weight information using performance scoring"""
-        with self.db_manager.get_session() as session:
-            miner = session.query(MinerInfo).filter(MinerInfo.hotkey == hotkey).first()
-
-            if not miner:
-                return {}
-
-            self.performance_ranker.challenge_interval = (
-                self.config.get_positive_number("validation.challenge_interval", int)
-            )
-            self.performance_ranker.participation_rate_threshold = (
-                self.config.get_range(
-                    "validation.participation_rate_threshold", 0.1, 1.0, float
-                )
-            )
-            eval_window = self.config.get_positive_number(
-                "validation.ranking_window_minutes", int
-            )
-
-            worker_rankings = self.performance_ranker.calculate_worker_performance(
-                evaluation_window_minutes=eval_window
-            )
-            raw_miner_challenge_scores = (
-                self.performance_ranker.calculate_miner_challenge_scores(
-                    worker_rankings
-                )
-            )
-            # Normalize challenges across all miners in metagraph for per-miner query
-            challenge_norm_map: Dict[str, float] = {}
-            all_hotkeys = list(self.metagraph.hotkeys)
-            max_raw = (
-                max(raw_miner_challenge_scores.values())
-                if raw_miner_challenge_scores
-                else 0.0
-            )
-            for hk in all_hotkeys:
-                raw_val = raw_miner_challenge_scores.get(hk, 0.0)
-                challenge_norm_map[hk] = (
-                    min(1.0, max(0.0, raw_val / max_raw)) if max_raw > 0 else 0.0
-                )
-            avg_norm = (
-                sum(challenge_norm_map.values()) / len(challenge_norm_map)
-                if challenge_norm_map
-                else 0.0
-            )
-
-            score, score_details = self._calculate_miner_score(
-                miner, challenge_norm_map, avg_norm
-            )
-
-            return {
-                "hotkey": hotkey,
-                "current_weight": miner.current_weight or 0.0,
-                "calculated_score": score,
-                "score_details": score_details,
-                "last_weight_update": (
-                    miner.last_weight_update.isoformat()
-                    if miner.last_weight_update
-                    else None
-                ),
-            }

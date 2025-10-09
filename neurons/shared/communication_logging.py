@@ -90,9 +90,13 @@ class CommunicationLogger:
 class NetworkRecorder:
     """Records communication to database (for validators only)"""
 
-    def __init__(self, database_manager, logger: CommunicationLogger):
+    def __init__(
+        self, database_manager, logger: CommunicationLogger, record_enabled: bool = True
+    ):
         self.db_manager = database_manager
         self.logger = logger
+        # When False, skip DB inserts to network_logs to control growth
+        self.record_enabled = bool(record_enabled)
 
     def record_inbound_request(
         self,
@@ -103,6 +107,9 @@ class NetworkRecorder:
         synapse: Any = None,
     ) -> int:
         """Record inbound request to network_logs"""
+        # Skip recording if disabled (e.g., non-DEBUG log level)
+        if not self.record_enabled:
+            return 0
         try:
             # Extract worker_id from decrypted data if available
             worker_id = None

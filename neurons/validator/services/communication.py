@@ -3,9 +3,66 @@ Validator Communication Service
 Handles incoming synapses from miners with clean logging and database recording
 """
 
+import asyncio
 import base64
 import json
+import threading
 import time
+from collections import OrderedDict
+from typing import Optional
+
+
+class _RLPeerWindow:
+    """Per-hotkey sliding window counter using fixed second buckets.
+
+    - buckets: size = window_seconds, index = sec % window_seconds
+    - total: rolling sum over active window
+    - last_cleaned_sec: last second we advanced to; used to clear aged-out buckets
+    """
+
+    def __init__(self, window_seconds: int) -> None:
+        self.window_seconds = int(max(1, window_seconds))
+        self.counts = [0] * self.window_seconds
+        self.bucket_secs = [-1] * self.window_seconds
+        self.total = 0
+        self.last_cleaned_sec: Optional[int] = None
+
+    def advance(self, now_sec: int) -> None:
+        if self.last_cleaned_sec is None:
+            self.last_cleaned_sec = now_sec
+            return
+        if now_sec <= self.last_cleaned_sec:
+            return
+        delta = now_sec - self.last_cleaned_sec
+        # Fast-forward at most window size
+        if delta > self.window_seconds:
+            delta = self.window_seconds
+        # For each second advanced, clear the bucket for that second index
+        for s in range(self.last_cleaned_sec + 1, self.last_cleaned_sec + delta + 1):
+            idx = s % self.window_seconds
+            prev = self.counts[idx]
+            if prev:
+                self.total -= prev
+                self.counts[idx] = 0
+            self.bucket_secs[idx] = s
+        self.last_cleaned_sec = self.last_cleaned_sec + delta
+
+    def would_block(self, max_requests: int) -> bool:
+        return self.total >= int(max_requests)
+
+    def add_now(self, now_sec: int) -> None:
+        idx = now_sec % self.window_seconds
+        # Ensure bucket is aligned to now_sec
+        if self.bucket_secs[idx] != now_sec:
+            prev = self.counts[idx]
+            if prev:
+                self.total -= prev
+            self.counts[idx] = 0
+            self.bucket_secs[idx] = now_sec
+        self.counts[idx] += 1
+        self.total += 1
+
+
 from typing import Any, Dict, Type
 
 import bittensor as bt
@@ -46,12 +103,41 @@ class ValidatorCommunicationService:
 
         # Logging components
         self.logger = CommunicationLogger("validator")
-        self.recorder = NetworkRecorder(database_manager, self.logger)
+        # Only record network logs to DB when log level is DEBUG to avoid growth
+        lvl = self.config.get("logging.log_level")
+        record_enabled = str(lvl).upper() == "DEBUG"
+        self.recorder = NetworkRecorder(
+            database_manager, self.logger, record_enabled=record_enabled
+        )
 
         # Registered processors keyed by stable protocol type string
         self._processors: Dict[str, SynapseProcessor] = {}
 
+        # Global per-hotkey rate limiter
+        self._rl_window_seconds = self.config.get_positive_number(
+            "security.rate_limit.window_seconds", int
+        )
+        self._rl_max_requests = self.config.get_positive_number(
+            "security.rate_limit.max_requests", int
+        )
+        # Per-hotkey sliding windows: hotkey -> _RLPeerWindow
+        self._rl_overall: Dict[str, _RLPeerWindow] = {}
+        # RL housekeeping constants (no config dependency)
+        self.RL_MAX_PEERS = 5000
+        # LRU implemented with OrderedDict for O(1) move/evict
+        # Key: peer_hotkey, Value: None (placeholder)
+        self._rl_lru: "OrderedDict[str, None]" = OrderedDict()
+        # Async lock to coordinate coroutines on the event loop
+        self._rl_lock = asyncio.Lock()
+        # Monotonic clock for RL to avoid wall-clock jumps
+        self._rl_clock = time.monotonic
+        # Simple counters
+        self._rl_blocked_total: int = 0
+
         bt.logging.info("🛰️ Validator communication service initialized")
+        bt.logging.info(
+            f"🧱 RL config | window={self._rl_window_seconds}s max={self._rl_max_requests} max_peers={self.RL_MAX_PEERS}"
+        )
 
     def register_processor(
         self, synapse_type: Type[EncryptedSynapse], processor: SynapseProcessor
@@ -195,6 +281,59 @@ class ValidatorCommunicationService:
             self.logger.log_request_start(
                 "handle_synapse", synapse_type_name, peer_address
             )
+
+            # Centralized per-hotkey rate limiting before decryption
+            try:
+                if peer_hotkey and synapse_type_name:
+                    async with self._rl_lock:
+                        now = self._rl_clock()
+                        now_sec = int(now)
+                        # Evict oldest peers if new peer and capacity exceeded
+                        is_new_peer = peer_hotkey not in self._rl_overall
+                        if is_new_peer:
+                            self._rl_evict_if_needed()
+                            if len(self._rl_overall) < self.RL_MAX_PEERS:
+                                self._rl_overall[peer_hotkey] = _RLPeerWindow(
+                                    self._rl_window_seconds
+                                )
+                            else:
+                                bt.logging.warning(
+                                    "⚠️ RL peer create blocked | reason=capacity"
+                                )
+                        wnd = self._rl_overall.get(peer_hotkey)
+                        if wnd is not None:
+                            wnd.advance(now_sec)
+                            if wnd.would_block(self._rl_max_requests):
+                                # Return plaintext error so miner can back off
+                                err = {
+                                    "error": "rate_limited",
+                                    "error_code": ErrorCodes.NETWORK_ERROR,
+                                }
+                                try:
+                                    synapse.response = json.dumps(err)
+                                except Exception:
+                                    synapse.response = json.dumps(
+                                        {"error": "rate_limited"}
+                                    )
+                                bt.logging.warning(
+                                    f"⚠️ Rate limited | type={synapse_type_name} hotkey={peer_hotkey} window={self._rl_window_seconds}s max={self._rl_max_requests}"
+                                )
+                                # Structured completion log & counters
+                                result.error_code = ErrorCodes.NETWORK_ERROR
+                                result.error_message = "rate_limited"
+                                self._rl_blocked_total += 1
+                                self.logger.log_request_complete(
+                                    "handle_synapse", result, peer_address
+                                )
+                                return synapse
+                            # Record current event
+                            wnd.add_now(now_sec)
+                            self._rl_touch_peer(peer_hotkey)
+            except Exception:
+                # Fail-open on limiter errors with warning
+                bt.logging.warning(
+                    "⚠️ RL error | type=unknown detail=exception_swallowed"
+                )
 
             # Find processor
             # Lookup by stable protocol type string to avoid class identity mismatches
@@ -460,6 +599,41 @@ class ValidatorCommunicationService:
             processing_time = (time.time() - start_time) * 1000
             result.processing_time_ms = processing_time
 
+    # --- Rate limiter housekeeping helpers ---
+    def _rl_touch_peer(self, peer_hotkey: str) -> None:
+        """Move peer to MRU position in LRU OrderedDict."""
+        try:
+            if peer_hotkey in self._rl_lru:
+                self._rl_lru.move_to_end(peer_hotkey, last=True)
+            else:
+                self._rl_lru[peer_hotkey] = None
+        except Exception:
+            # Best-effort only
+            pass
+
+    def _rl_evict_if_needed(self) -> None:
+        """Evict least-recently-used peers if capacity exceeded."""
+        try:
+            evicted = 0
+            while len(self._rl_overall) >= self.RL_MAX_PEERS and self._rl_lru:
+                try:
+                    oldest, _ = self._rl_lru.popitem(last=False)
+                except Exception:
+                    break
+                if oldest in self._rl_overall:
+                    try:
+                        del self._rl_overall[oldest]
+                        evicted += 1
+                    except Exception:
+                        pass
+            if evicted:
+                bt.logging.info(
+                    f"🧹 RL evict | count={evicted} max_peers={self.RL_MAX_PEERS}"
+                )
+        except Exception:
+            # Do not block request path
+            pass
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get communication statistics"""
         session_stats = self.session_manager.get_session_stats()
@@ -467,4 +641,11 @@ class ValidatorCommunicationService:
             "registered_processors": len(self._processors),
             "processor_types": list(self._processors.keys()),
             "session_stats": session_stats,
+            "rate_limit": {
+                "window_seconds": self._rl_window_seconds,
+                "max_requests": self._rl_max_requests,
+                "tracked_peers": len(self._rl_overall),
+                "max_peers": self.RL_MAX_PEERS,
+                "blocked_total": self._rl_blocked_total,
+            },
         }

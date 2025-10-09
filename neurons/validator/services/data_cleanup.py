@@ -13,16 +13,23 @@ class DataCleanupService:
     """
     Periodic database data retention service.
 
-    - Runs once on startup
-    - Runs daily at local midnight
+    - Runs daily at 00:00 UTC
     - Keeps only the last N days of data (default: 7)
     """
 
-    def __init__(self, database_manager: DatabaseManager, retention_days: int = 7):
+    def __init__(
+        self,
+        database_manager: DatabaseManager,
+        retention_days: int = 7,
+        min_heartbeat_hours: Optional[int] = None,
+    ):
         if retention_days <= 0:
             raise ValueError("retention_days must be positive")
         self.db = database_manager
         self.retention_days = retention_days
+        self.min_heartbeat_hours = (
+            int(min_heartbeat_hours) if isinstance(min_heartbeat_hours, int) else None
+        )
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -31,8 +38,6 @@ class DataCleanupService:
             bt.logging.warning("⚠️ Data cleanup already running")
             return
         self._running = True
-        # Run initial cleanup immediately
-        await self.run_once()
         # Start background scheduler
         self._task = asyncio.create_task(self._loop())
         bt.logging.info("🧹 Data cleanup scheduler started")
@@ -53,8 +58,8 @@ class DataCleanupService:
     async def _loop(self) -> None:
         while self._running:
             try:
-                # Sleep until next local midnight
-                sleep_seconds = self._seconds_until_next_midnight()
+                # Sleep until next UTC midnight
+                sleep_seconds = self._seconds_until_next_utc_midnight()
                 await asyncio.sleep(sleep_seconds)
                 await self.run_once()
             except asyncio.CancelledError:
@@ -69,21 +74,30 @@ class DataCleanupService:
         cutoff = datetime.utcnow() - timedelta(days=self.retention_days)
         try:
             with self.db.get_session() as session:
-                deleted = self.db.cleanup_old_data(session, self.retention_days)
+                deleted = self.db.cleanup_old_data(
+                    session,
+                    self.retention_days,
+                    min_heartbeat_hours=self.min_heartbeat_hours,
+                )
                 total = sum(deleted.values())
                 # Log concise aggregation and per-table metrics at DEBUG
-                bt.logging.info(
-                    f"🧹 DB cleanup | total={total} days={self.retention_days} cutoff={cutoff.isoformat()}"
-                )
+                if self.min_heartbeat_hours and self.min_heartbeat_hours > 0:
+                    bt.logging.info(
+                        f"🧹 DB cleanup | total={total} days={self.retention_days} hb_hours={self.min_heartbeat_hours} cutoff={cutoff.isoformat()}"
+                    )
+                else:
+                    bt.logging.info(
+                        f"🧹 DB cleanup | total={total} days={self.retention_days} cutoff={cutoff.isoformat()}"
+                    )
                 for table, count in (deleted or {}).items():
                     bt.logging.debug(f"cleanup_detail | table={table} deleted={count}")
         except Exception as e:
             bt.logging.error(f"❌ DB cleanup error | error={e}")
 
     @staticmethod
-    def _seconds_until_next_midnight() -> float:
-        now_local = datetime.now()
-        tomorrow = now_local.date() + timedelta(days=1)
-        next_midnight = datetime.combine(tomorrow, dtime.min)
-        delta = (next_midnight - now_local).total_seconds()
+    def _seconds_until_next_utc_midnight() -> float:
+        now_utc = datetime.utcnow()
+        tomorrow_utc = now_utc.date() + timedelta(days=1)
+        next_midnight_utc = datetime.combine(tomorrow_utc, dtime.min)
+        delta = (next_midnight_utc - now_utc).total_seconds()
         return max(1.0, delta)

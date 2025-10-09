@@ -125,7 +125,7 @@ class SessionManager:
         # Check handshake rate limiting
         attempts = self._handshake_attempts[peer_hotkey]
 
-        # Clean up old attempts outside the rate limit window
+        # Clean up expired attempts outside rate limit window
         while (
             attempts
             and attempts[0] < current_time - CryptoManager.RATE_LIMIT_WINDOW_SECONDS
@@ -298,8 +298,8 @@ class SessionManager:
                 synapse_type,
             )
 
-            # Check sequence number for replay protection AFTER decryption and authentication
-            # This prevents DoS attacks where an attacker could advance the sequence window with invalid packages
+            # Validate sequence for replay protection after decryption
+            # Prevents DoS attacks from advancing sequence window with invalid packages
             if not session.replay_validator_cs.validate_sequence(seq, "client"):
                 from neurons.shared.protocols import ErrorCodes
 
@@ -448,7 +448,7 @@ class SessionManager:
         current_time = time.time()
         rate_limited_peers = 0
         for peer_hotkey, attempts in self._handshake_attempts.items():
-            # Clean up old attempts
+            # Clean up expired attempts
             while (
                 attempts
                 and attempts[0] < current_time - CryptoManager.RATE_LIMIT_WINDOW_SECONDS

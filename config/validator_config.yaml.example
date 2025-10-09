@@ -9,6 +9,7 @@ subtensor:
   network: finney                 # Network type: local, test, finney
 metagraph:
   weight_update_tempo: 105        # Number of blocks between weight updates
+  sync_interval: 60               # Metagraph sync interval (seconds)
 
 # Wallet configuration
 wallet:
@@ -18,8 +19,7 @@ wallet:
 
 # Logging configuration
 logging:
-  log_level: DEBUG
-  enable_debug: true
+  log_level: INFO
   log_dir: ./logs
 
 # Database configuration
@@ -39,17 +39,17 @@ meshhub:
   capabilities:
     - hardware_inspection
     - challenge_validation
-  reconnect_delay_seconds: 15               # Fixed delay for auto-reconnect on failure
-  heartbeat_interval_seconds: 30            # Heartbeat upload interval
-  resource_report_interval_seconds: 60      # Resource snapshot upload interval
+  reconnect_delay_seconds: 30               # Fixed delay for auto-reconnect on failure
+  heartbeat_interval_seconds: 60            # Heartbeat upload interval
+  resource_report_interval_seconds: 90      # Resource snapshot upload interval
 
 # Validation configuration
 validation:
   challenge_interval: 240                   # Challenge interval (in seconds)
-  challenge_timeout: 90                     # Challenge timeout (in seconds)
+  challenge_timeout: 60                     # Challenge timeout (in seconds)
   ranking_window_minutes: 180               # Ranking window (in minutes)
-  participation_rate_threshold: 0.75        # Participation rate threshold for two-stage ranking
-  verification_concurrent: -1               # Concurrent verification tasks (-1 = cpu_count - 1, or specify positive number)
+  participation_rate_threshold: 0.80        # Participation rate threshold for baseline (full at ≥ threshold)
+  verification_concurrent: 1                # Concurrent verification tasks (-1 = cpu_count - 1, or specify positive number)
   verification_interval: 30                 # Verification polling interval in seconds
   proof_queue_max_size: 1000                # Maximum proof cache size (LRU eviction)
   challenge_type: 'gpu_matrix'              # Challenge type: 'cpu_matrix' or 'gpu_matrix'
@@ -69,7 +69,6 @@ validation:
     size_variance: 0.05                     # Matrix size variance (±5% variance)
     iterations: 1                           # Number of iterations (workload intensity)
     enable_normalization: true              # Enable time normalization based on GPU count
-    mode: 0                                 # GPU computation mode (0=workload, 1=duration)
     verification:
       coordinate_sample_count: 25           # Random coordinate spot checks (set to 0 to disable)
       coordinate_sample_count_variance: 0.2 # Random coordinate variance (±20% variance)
@@ -79,9 +78,29 @@ validation:
       abs_tolerance: 0.02                   # Absolute tolerance for FP16/FP64 comparison
       rel_tolerance: 0.005                  # Relative tolerance (0.5%) for precision differences
       success_rate_threshold: 0.85          # Required success rate for verification (85%)
+    model_allowlist:                        # Allowed GPU models (case-insensitive substring match)
+      - "RTX 3090"
+      - "RTX 4090"
+      - "RTX 5090"
+      - "A100-SXM4-80GB"
+      - "A100 80GB"
+      - "A100-PCIE-80GB"
+      - "H100 80GB"
+      - "H100-PCIE-80GB"
+      - "H100 94GB"
+      - "H200"
+      - "B200"
 
 # Weight management configuration
 weight_management:
   score_weights:
     lease_weight: 0.70            # Lease status weight
     challenge_weight: 0.30        # CPU matrix challenge performance
+  availability:
+    window_hours: 169             # Availability window hours for scoring (7 days)
+
+# Security configuration
+security:
+  rate_limit:
+    window_seconds: 30            # Per-hotkey sliding window (seconds)
+    max_requests: 150             # Max requests per window per hotkey

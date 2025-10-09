@@ -36,8 +36,9 @@ class WorkerPerformanceScore:
         self.total_attempts = total_attempts
         self.total_compute_ms = total_compute_ms
         self.success_count_avg = success_count_avg
-        self.performance_score = 0.0  # Will be calculated by ranker
+        self.performance_score = 0.0  # Calculated by ranker
         self.order_index = 0  # Position in ordered list (0-based)
+        self.availability = 1.0  # Per-worker availability in [0,1]
 
         # Participation tiering fields
         self.participation_score = 0.0  # Participation score for ordering
@@ -61,14 +62,22 @@ class WorkerPerformanceRanker:
         database_manager: DatabaseManager,
         challenge_interval: int = 180,
         participation_rate_threshold: float = 0.75,
+        availability_window_hours: int = 169,
     ):
         self.db_manager = database_manager
-        self.performance_cache: Dict[str, WorkerPerformanceScore] = {}
-        self.last_update_ts = 0.0
 
         # Participation configuration
         self.challenge_interval = challenge_interval
         self.participation_rate_threshold = participation_rate_threshold
+        # Availability configuration
+        self.availability_window_hours = int(availability_window_hours)
+
+        # Availability caching, key -> (availability, timestamp)
+        self._availability_cache: Dict[str, Tuple[float, float]] = {}
+        self._cache_ttl = 60.0  # seconds
+        # Cache capacity controls periodic trimming; set higher for larger participation sets
+        self._cache_capacity = 2000
+        self._cache_keep = int(self._cache_capacity * 0.8)
 
     def calculate_worker_performance(
         self, evaluation_window_minutes: int
@@ -174,7 +183,7 @@ class WorkerPerformanceRanker:
                         mismatch = False
                         for u in gpu_uuids:
                             owner = uuid_owner_map.get(u)
-                            if owner is not None and owner != challenge.hotkey:
+                            if owner != challenge.hotkey:
                                 mismatch = True
                                 break
                         if mismatch:
@@ -207,6 +216,21 @@ class WorkerPerformanceRanker:
                         success_count
                     )
                     # Keep only aggregate counts; last success_count not needed
+
+            # Compute per-worker availability over configured window
+            worker_availability: Dict[str, float] = {}
+            try:
+                worker_availability = self._compute_worker_availability(
+                    session=session,
+                    hours=self.availability_window_hours,
+                    limit_to_worker_keys=set(worker_stats.keys()),
+                    consistency_minutes=evaluation_window_minutes,
+                )
+            except Exception as e:
+                bt.logging.warning(
+                    f"⚠️ Worker availability compute failed | error={e} using_ones"
+                )
+                worker_availability = {k: 1.0 for k in worker_stats.keys()}
 
             # Calculate metrics and absolute scores for each worker
             workers_for_ordering = []
@@ -294,17 +318,238 @@ class WorkerPerformanceRanker:
                     if (be is None or be <= 0)
                     else min(1.0, (ap / be) if be > 0 else 1.0)
                 )
-                worker_score.performance_score = base_score * participation_coeff
 
+                # Multiply by per-worker availability
+                key_for_avail = f"{worker_data['hotkey']}_{worker_data['worker_id']}"
+                avail = float(worker_availability.get(key_for_avail, 0.0))
+                avail = max(0.0, min(1.0, avail))
+                worker_score.availability = avail
+
+                worker_score.performance_score = (
+                    base_score * participation_coeff * avail
+                )
                 worker_scores[worker_key] = worker_score
 
-            self.performance_cache = worker_scores
-            self.last_update_ts = time.time()
+            # End of scoring pass
 
             # Logging results
             self._log_performance_summary(worker_scores, evaluation_window_minutes)
 
-            return worker_scores
+        return worker_scores
+
+    def _compute_worker_availability(
+        self,
+        session,
+        hours: int,
+        limit_to_worker_keys: Optional[set] = None,
+        consistency_minutes: int = 180,
+    ) -> Dict[str, float]:
+        """Compute per-worker availability over a window using hotkey-level GPU presence union and per-worker IP penalty.
+
+        Returns: ("{hotkey}_{worker_id}") -> availability in [0,1]
+        """
+        from neurons.validator.models.database import (ComputeChallenge,
+                                                       HeartbeatRecord)
+
+        if hours <= 0:
+            return {k: 1.0 for k in (limit_to_worker_keys or [])}
+
+        # Check cache for improved performance
+        now = time.time()
+        cache_key_params = f"h{hours}_cm{consistency_minutes}"
+        cached_results: Dict[str, float] = {}
+        uncached_keys: set = set()
+
+        if limit_to_worker_keys:
+            for key in limit_to_worker_keys:
+                cache_key = f"{key}_{cache_key_params}"
+                if cache_key in self._availability_cache:
+                    availability, timestamp = self._availability_cache[cache_key]
+                    if now - timestamp < self._cache_ttl:
+                        cached_results[key] = availability
+                        continue
+                uncached_keys.add(key)
+        else:
+            uncached_keys = set()
+
+        # If all results are cached, return early
+        if limit_to_worker_keys and not uncached_keys:
+            return cached_results
+
+        window_start = datetime.utcnow() - timedelta(hours=hours)
+
+        q = (
+            session.query(HeartbeatRecord)
+            .filter(HeartbeatRecord.created_at >= window_start)
+            .filter(HeartbeatRecord.deleted_at.is_(None))
+            .order_by(HeartbeatRecord.created_at.asc(), HeartbeatRecord.id.asc())
+        )
+        records = q.all()
+
+        by_worker: Dict[str, List[HeartbeatRecord]] = {}
+        by_hotkey_bucket_uuids: Dict[str, Dict[int, set]] = {}
+        needed_hotkeys: Optional[set] = None
+        if limit_to_worker_keys:
+            needed_hotkeys = {k.split("_", 1)[0] for k in limit_to_worker_keys}
+
+        for r in records:
+            if not r.hotkey:
+                continue
+            if r.worker_id:
+                wkey = f"{r.hotkey}_{r.worker_id}"
+                if not limit_to_worker_keys or wkey in limit_to_worker_keys:
+                    by_worker.setdefault(wkey, []).append(r)
+
+            # Hotkey-level GPU presence per 5-min bucket for acceptance
+            if needed_hotkeys and r.hotkey not in needed_hotkeys:
+                continue
+            b = int(r.created_at.timestamp() // 300)
+            try:
+                present = self._extract_hb_gpu_uuids(r)
+            except Exception:
+                present = set()
+            if present:
+                by_hotkey_bucket_uuids.setdefault(r.hotkey, {}).setdefault(
+                    b, set()
+                ).update(present)
+
+        # Build recent GPU participation set per worker for stricter availability
+        recent_gpu_by_worker: Dict[str, set] = {}
+        gpu_cutoff = datetime.utcnow() - timedelta(
+            minutes=max(1, int(consistency_minutes))
+        )
+        cg = (
+            session.query(ComputeChallenge)
+            .filter(ComputeChallenge.created_at >= gpu_cutoff)
+            .filter(ComputeChallenge.deleted_at.is_(None))
+            .filter(ComputeChallenge.verification_result.is_(True))
+        )
+        for ch in cg.all():
+            if not ch.worker_id or not ch.hotkey:
+                continue
+            wkey = f"{ch.hotkey}_{ch.worker_id}"
+            if limit_to_worker_keys and wkey not in limit_to_worker_keys:
+                continue
+            try:
+                mc = ch.merkle_commitments or {}
+                uuids = {
+                    u
+                    for u in (mc.keys() if isinstance(mc, dict) else [])
+                    if u and u != "-1"
+                }
+            except Exception:
+                uuids = set()
+            if uuids:
+                recent_gpu_by_worker.setdefault(wkey, set()).update(uuids)
+
+        expected_intervals = max(1, int(hours * 12))  # 5-min buckets
+        result: Dict[str, float] = {}
+
+        for key, recs in by_worker.items():
+            # Stable IP-change detection sort
+            recs.sort(key=lambda r: (r.created_at, r.id))
+
+            # Per-worker grouping for IP penalty source
+            required = recent_gpu_by_worker.get(key, set())
+            intervals: set = set()
+
+            hotkey = key.split("_", 1)[0]
+            hb_uuids_by_bucket = by_hotkey_bucket_uuids.get(hotkey, {})
+            if not required:
+                # CPU/no-GPU: count bucket only if this worker_id has a heartbeat
+                intervals = {int(r.created_at.timestamp() // 300) for r in recs}
+            else:
+                for b, present in hb_uuids_by_bucket.items():
+                    try:
+                        if required.issubset(present):
+                            intervals.add(b)
+                    except Exception:
+                        continue
+            online_ratio = min(1.0, len(intervals) / expected_intervals)
+
+            # Per-worker IP change penalty
+            ip_changes_for_this_worker = 0
+            last_ip: Optional[str] = None
+            for r in recs:
+                ip = getattr(r, "public_ip", None)
+                if not ip:
+                    continue
+                if last_ip is None:
+                    last_ip = ip
+                elif ip != last_ip:
+                    ip_changes_for_this_worker += 1
+                    last_ip = ip
+
+            if ip_changes_for_this_worker > 0:
+                penalty = 0.5**ip_changes_for_this_worker
+                if penalty < 0.1:
+                    penalty = 0.0
+                online_ratio *= penalty
+
+            computed_availability = max(0.0, min(1.0, float(online_ratio)))
+            result[key] = computed_availability
+
+            # Update cache for this worker
+            cache_key = f"{key}_{cache_key_params}"
+            self._availability_cache[cache_key] = (computed_availability, now)
+
+        # Workers with no heartbeats → availability 0 if present in limit
+        if limit_to_worker_keys:
+            for k in limit_to_worker_keys:
+                if k not in result:
+                    result[k] = 0.0
+                    # Cache the zero availability too
+                    cache_key = f"{k}_{cache_key_params}"
+                    self._availability_cache[cache_key] = (0.0, now)
+
+        # Merge cached and computed results
+        final_result = {**cached_results, **result}
+
+        # Periodic cache cleanup: purge expired first, then cap by capacity
+        try:
+            if self._availability_cache:
+                expired = [
+                    k
+                    for k, (_val, ts) in self._availability_cache.items()
+                    if now - ts >= self._cache_ttl
+                ]
+                if expired:
+                    for k in expired:
+                        self._availability_cache.pop(k, None)
+        except Exception:
+            pass
+
+        if len(self._availability_cache) > self._cache_capacity:
+            try:
+                sorted_items = sorted(
+                    self._availability_cache.items(),
+                    key=lambda x: x[1][1],
+                    reverse=True,
+                )
+                keep_n = max(1, int(self._cache_keep))
+                self._availability_cache = dict(sorted_items[:keep_n])
+            except Exception:
+                self._availability_cache.clear()
+
+        return final_result
+
+    def _extract_hb_gpu_uuids(self, hb: Any) -> set:
+        try:
+            data = getattr(hb, "gpu_utilization", None)
+            if not data:
+                return set()
+            if isinstance(data, list):
+                uuids = set()
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    u = item.get("uuid") or item.get("gpu_uuid") or item.get("id")
+                    if isinstance(u, str) and u and u != "-1":
+                        uuids.add(u)
+                return uuids
+        except Exception:
+            return set()
+        return set()
 
     def calculate_miner_challenge_scores(
         self, ranked_workers: Dict[str, WorkerPerformanceScore]
@@ -348,27 +593,6 @@ class WorkerPerformanceRanker:
         )
 
         return miner_challenge_scores
-
-    def get_worker_performance_score(self, hotkey: str, worker_id: str) -> float:
-        """Get cached performance score for a specific worker"""
-        worker_key = f"{hotkey}_{worker_id}"
-
-        if worker_key in self.performance_cache:
-            return self.performance_cache[worker_key].performance_score
-
-        return 0.0  # No recent performance data
-
-    def get_miner_worker_count_and_scores(self, hotkey: str) -> Tuple[int, List[float]]:
-        """Get worker count and scores for a specific miner"""
-        worker_scores = []
-
-        for worker_key, worker_score in self.performance_cache.items():
-            if worker_score.hotkey == hotkey:
-                worker_scores.append(worker_score.performance_score)
-
-        return len(worker_scores), worker_scores
-
-    # Removed legacy rank-based scoring function
 
     def _calculate_absolute_performance_score(self, average_time_ms: float) -> float:
         """
@@ -456,38 +680,3 @@ class WorkerPerformanceRanker:
         )
 
         return {hotkey: count for hotkey, count in leased_worker_counts}
-
-    def get_performance_statistics(self) -> Dict[str, Any]:
-        """Get statistics about current performance cache"""
-        if not self.performance_cache:
-            return {
-                "total_workers": 0,
-                "last_update": self.last_update_ts,
-                "score_distribution": {},
-            }
-
-        scores = [w.performance_score for w in self.performance_cache.values()]
-        execution_times = [w.execution_time_ms for w in self.performance_cache.values()]
-
-        # Calculate score distribution
-        score_ranges = {
-            "0.8-1.0": len([s for s in scores if s >= 0.8]),
-            "0.5-0.8": len([s for s in scores if 0.5 <= s < 0.8]),
-            "0.2-0.5": len([s for s in scores if 0.2 <= s < 0.5]),
-            "0.0-0.2": len([s for s in scores if s < 0.2]),
-        }
-
-        return {
-            "total_workers": len(self.performance_cache),
-            "last_update": self.last_update_ts,
-            "score_distribution": score_ranges,
-            "execution_time_range_ms": {
-                "min": min(execution_times) if execution_times else 0,
-                "max": max(execution_times) if execution_times else 0,
-                "avg": (
-                    sum(execution_times) / len(execution_times)
-                    if execution_times
-                    else 0
-                ),
-            },
-        }

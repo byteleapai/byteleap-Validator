@@ -17,8 +17,8 @@ from neurons.shared.crypto import CryptoManager
 from neurons.validator.models.database import DatabaseManager
 
 # Network/performance batching limits
-SCORE_REPORT_BATCH_SIZE = 100  # workerScores per SCORE_REPORT
-RESOURCE_REPORT_MAX_WORKERS = 100  # workers per RESOURCE_REPORT batch (across miners)
+SCORE_REPORT_BATCH_SIZE = 50  # workerScores per SCORE_REPORT
+RESOURCE_REPORT_MAX_WORKERS = 50  # workers per RESOURCE_REPORT
 
 
 @dataclass
@@ -665,7 +665,7 @@ class MeshHubClient:
                                 await self._send_encrypted_ws(
                                     "MESH_RESOURCE_REPORT_V1", batched_payload
                                 )
-                        # Apply pending worker hash updates only after send attempt
+                        # Apply pending worker hash updates after send attempt
                         try:
                             for wk_key, h in (
                                 pending_updates.get("workers") or {}
@@ -677,7 +677,7 @@ class MeshHubClient:
                         except Exception:
                             pass
 
-                        # Mark full sent and update watermark after a send attempt
+                        # Mark full sent and update watermark after send attempt
                         if full_mode:
                             self._initial_resource_full_sent = True
                         try:
@@ -1012,7 +1012,7 @@ class MeshHubClient:
                                     include_hardware=False,
                                 )
                             worker_list.append(worker_payload)
-                            # Queue hash updates to apply after successful send
+                            # Queue hash updates to apply after send
                             pending_updates["workers"][wk_key] = {
                                 "state": hashes["state"],
                                 "hardware": hashes["hardware"] if include_hw else None,
@@ -1060,27 +1060,39 @@ class MeshHubClient:
         self,
         effective_at: Optional[str] = None,
         worker_scores: Optional[List[Dict[str, Any]]] = None,
+        miner_scores: Optional[List[Dict[str, Any]]] = None,
         global_stats: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Publish a score report on demand (event-driven)."""
         if not self.session:
             return
-        if not worker_scores:
+        if not worker_scores and not miner_scores:
             return
 
+        worker_scores = worker_scores or []
+        miner_scores = miner_scores or []
+
+        # First packet: only minerScores (+ optional globalStats/effectiveAt)
+        if miner_scores:
+            first_payload: Dict[str, Any] = {
+                "minerScores": miner_scores,
+                "globalStats": global_stats,
+                "effectiveAt": effective_at,
+                "timestamp": self._utc_now_iso(),
+                "version": "1.0",
+            }
+            await self._send_encrypted_ws("MESH_SCORE_REPORT_V1", first_payload)
+
+        # Subsequent packets: chunked workerScores only
         total = len(worker_scores)
         sent = 0
         while sent < total:
             chunk = worker_scores[sent : sent + SCORE_REPORT_BATCH_SIZE]
             payload: Dict[str, Any] = {
                 "workerScores": chunk,
+                "effectiveAt": effective_at,
                 "timestamp": self._utc_now_iso(),
                 "version": "1.0",
             }
-            if effective_at:
-                payload["effectiveAt"] = effective_at
-            if global_stats:
-                payload["globalStats"] = global_stats
-
             await self._send_encrypted_ws("MESH_SCORE_REPORT_V1", payload)
             sent += len(chunk)

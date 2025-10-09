@@ -25,6 +25,22 @@ from neurons.validator.services.worker_performance_ranker import \
     WorkerPerformanceRanker
 
 
+def _is_model_allowed(model: str, patterns) -> bool:
+    """Case-insensitive substring match; None/[] patterns means unrestricted."""
+    try:
+        if not patterns:
+            return True
+        if not isinstance(model, str) or not model:
+            return False
+        name = model.lower()
+        for p in patterns:
+            if isinstance(p, str) and p and p.lower() in name:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 class MinerValidationService:
     """
     Miner validation service for computational capability verification
@@ -80,7 +96,6 @@ class MinerValidationService:
         self.gpu_enable_normalization = config.get(
             "validation.gpu.enable_normalization"
         )
-        self.gpu_mode = config.get("validation.gpu.mode")
 
         self.validator_hotkey = wallet.hotkey.ss58_address
 
@@ -187,7 +202,7 @@ class MinerValidationService:
                         "validation.challenge_interval", int
                     )
                 except Exception:
-                    # Fall back to previously validated value
+                    # Use cached validation
                     interval = self.challenge_interval
                 await asyncio.sleep(interval)
 
@@ -293,14 +308,19 @@ class MinerValidationService:
                             f"Skip worker | id={worker.worker_id} reason=missing_capabilities has={worker_capabilities}"
                         )
                         continue
+                    pending_states = [
+                        ChallengeStatus.CREATED,
+                        ChallengeStatus.SENT,
+                        ChallengeStatus.COMMITTED,
+                        ChallengeStatus.VERIFYING,
+                    ]
+
                     pending_challenges = (
                         session.query(ComputeChallenge)
                         .filter(
                             ComputeChallenge.hotkey == miner.hotkey,
                             ComputeChallenge.worker_id == worker.worker_id,
-                            ComputeChallenge.challenge_status.in_(
-                                [ChallengeStatus.CREATED, ChallengeStatus.VERIFYING]
-                            ),
+                            ComputeChallenge.challenge_status.in_(pending_states),
                             ComputeChallenge.deleted_at.is_(None),
                         )
                         .count()
@@ -309,7 +329,7 @@ class MinerValidationService:
                     if pending_challenges > 0:
                         bt.logging.debug(
                             f"Skipping worker {worker.worker_id} - "
-                            f"{pending_challenges} pending challenges exist (CREATED/VERIFYING)"
+                            f"{pending_challenges} pending challenges exist in {pending_states}"
                         )
                         continue
                     worker_capabilities = worker.capabilities or []
@@ -330,6 +350,31 @@ class MinerValidationService:
                             f"Skipping worker {worker.worker_id} - no CPU capability for cpu_matrix mode"
                         )
                         continue
+
+                    # Optional pre-filter: only issue GPU challenges to allowlisted GPU models
+                    if dyn_type == "gpu_matrix":
+                        try:
+                            patterns = self.config.get("validation.gpu.model_allowlist")
+                            gpu_inventory = self.db_manager.get_gpu_inventory_by_worker(
+                                session, miner.hotkey, worker.worker_id
+                            )
+                            allowed = 0
+                            total = 0
+                            for g in gpu_inventory:
+                                if g.gpu_uuid and g.gpu_uuid != "-1":
+                                    total += 1
+                                    if _is_model_allowed((g.gpu_model or ""), patterns):
+                                        allowed += 1
+                            # No GPUs in inventory → skip; when allowlist is []/null, patterns is empty and all models allowed
+                            if total == 0 or allowed == 0:
+                                bt.logging.debug(
+                                    f"Skip worker {worker.worker_id} - no allowlisted GPUs (total={total} allowed={allowed})"
+                                )
+                                continue
+                        except Exception as e:
+                            bt.logging.warning(
+                                f"⚠️ Allowlist precheck failed | worker={worker.worker_id} error={e}"
+                            )
 
                     eligible_workers.append(worker)
 
@@ -361,15 +406,12 @@ class MinerValidationService:
                             gpu_iterations = self.config.get(
                                 "validation.gpu.iterations"
                             )
-                            gpu_mode = self.config.get("validation.gpu.mode")
-
                             challenge_data = GPUMatrixChallenge.generate_challenge(
                                 matrix_size=gpu_matrix_size,
                                 validator_hotkey=self.validator_hotkey,
                                 enable_dynamic_size=gpu_size_variance > 0,
                                 size_variance=gpu_size_variance,
                                 iterations=gpu_iterations,
-                                mode=gpu_mode,
                             )
                             challenge_data["challenge_type"] = "gpu_matrix"
                         else:
@@ -480,7 +522,7 @@ class MinerValidationService:
         except Exception as e:
             bt.logging.error(f"❌ Cleanup error | error={e}")
 
-        # Clean up old submission tracking records
+        # Clean up expired submission tracking records
         current_time = time.time()
         expired_used_challenges = []
         for challenge_id, used_timestamp in self._used_challenges.items():

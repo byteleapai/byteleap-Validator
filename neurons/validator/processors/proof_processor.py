@@ -267,10 +267,10 @@ class ProofProcessor(SynapseProcessor):
             return f"CPU proof should have UUID '-1', got '{proof.uuid}'"
 
         # Check required fields
-        if not hasattr(proof, "row_hashes") or not proof.row_hashes:
+        if not proof.row_hashes:
             return "CPU proof missing row_hashes"
 
-        if not hasattr(proof, "merkle_proofs") or not proof.merkle_proofs:
+        if not proof.merkle_proofs:
             return "CPU proof missing merkle_proofs"
 
         return None
@@ -286,15 +286,15 @@ class ProofProcessor(SynapseProcessor):
                 return f"GPU proof should have valid GPU UUID, got '{proof.uuid}'"
 
             # Check required fields for GPU proofs
-            if not hasattr(proof, "coordinate_values") or not proof.coordinate_values:
+            if not proof.coordinate_values:
                 return f"GPU proof {proof.uuid} missing coordinate_values"
 
             # GPU proofs must have row hashes for Merkle verification
-            if not hasattr(proof, "row_hashes") or not proof.row_hashes:
+            if not proof.row_hashes:
                 return f"GPU proof {proof.uuid} missing row_hashes"
 
             # GPU proofs must have Merkle proofs for verification
-            if not hasattr(proof, "merkle_proofs") or not proof.merkle_proofs:
+            if not proof.merkle_proofs:
                 return f"GPU proof {proof.uuid} missing merkle_proofs"
 
         return None
@@ -317,16 +317,16 @@ class ProofProcessor(SynapseProcessor):
             }
 
             # Add proof-specific data
-            if hasattr(proof, "row_hashes") and proof.row_hashes:
+            if proof.row_hashes:
                 proof_data["row_hashes"] = proof.row_hashes
 
-            if hasattr(proof, "merkle_proofs") and proof.merkle_proofs:
+            if proof.merkle_proofs:
                 proof_data["merkle_proofs"] = proof.merkle_proofs
 
-            if hasattr(proof, "coordinate_values") and proof.coordinate_values:
+            if proof.coordinate_values:
                 proof_data["coordinate_values"] = proof.coordinate_values
 
-            if hasattr(proof, "computation_time_ms") and proof.computation_time_ms:
+            if getattr(proof, "computation_time_ms", None):
                 proof_data["computation_time_ms"] = proof.computation_time_ms
 
             serialized_proofs[proof.uuid] = proof_data

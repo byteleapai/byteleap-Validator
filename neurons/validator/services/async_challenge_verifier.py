@@ -677,7 +677,7 @@ class AsyncChallengeVerifier:
         while self.running:
             try:
                 # Get oldest pending challenges
-                pending_challenges = self._get_oldest_verifying_challenges()
+                pending_challenges = self._get_newest_verifying_challenges()
 
                 if pending_challenges:
                     bt.logging.debug(
@@ -723,7 +723,7 @@ class AsyncChallengeVerifier:
                 bt.logging.error(f"❌ Unexpected error in verification loop: {e}")
                 await asyncio.sleep(self._get_verification_interval())
 
-    def _get_oldest_verifying_challenges(self) -> List[ComputeChallenge]:
+    def _get_newest_verifying_challenges(self) -> List[ComputeChallenge]:
         """
         Get newest VERIFYING challenges, and mark stale ones (>1h) failed
 
@@ -738,7 +738,12 @@ class AsyncChallengeVerifier:
                 stale_list = (
                     session.query(ComputeChallenge)
                     .filter(
-                        ComputeChallenge.challenge_status == ChallengeStatus.VERIFYING,
+                        ComputeChallenge.challenge_status.in_(
+                            [
+                                ChallengeStatus.VERIFYING,
+                                ChallengeStatus.COMMITTED,
+                            ]
+                        ),
                         ComputeChallenge.deleted_at.is_(None),
                         ComputeChallenge.computed_at.isnot(None),
                         ComputeChallenge.computed_at < stale_cutoff,
@@ -874,24 +879,47 @@ class AsyncChallengeVerifier:
             # Prepare per-challenge payload and offload verification
             cache_key = f"{challenge.hotkey}:{challenge.worker_id}"
             cached_proof = self.proof_cache.get_proof(cache_key)
+
+            do_offload = True
+            success = False
+            verification_details: Dict[str, Any] = {}
+
             if not cached_proof:
                 bt.logging.error(
                     f"No cached proof found for challenge {challenge.challenge_id}, key={cache_key[:12]}..."
                 )
-                return False, {"error": "No cached proof data"}
+                do_offload = False
+                verification_details = {
+                    "error": "No cached proof data",
+                    "notes": "Missing cached proof for verification",
+                    "success_count": 0,
+                }
 
-            if cached_proof.get("challenge_id") != challenge.challenge_id:
+            if (
+                do_offload
+                and cached_proof.get("challenge_id") != challenge.challenge_id
+            ):
                 bt.logging.error(
                     f"Cached proof challenge_id mismatch: expected={challenge.challenge_id}, cached={cached_proof.get('challenge_id')}"
                 )
-                return False, {"error": "Challenge ID mismatch"}
+                do_offload = False
+                verification_details = {
+                    "error": "Challenge ID mismatch",
+                    "notes": "Cached proof belongs to different challenge_id",
+                    "success_count": 0,
+                }
 
-            proof_data = cached_proof.get("proofs", {})
-            if not proof_data:
+            proof_data = cached_proof.get("proofs", {}) if cached_proof else {}
+            if do_offload and not proof_data:
                 bt.logging.error(
                     f"No proof data in cache for challenge {challenge.challenge_id}"
                 )
-                return False, {"error": "No proof data in cache"}
+                do_offload = False
+                verification_details = {
+                    "error": "No proof data in cache",
+                    "notes": "Cached proof record missing proofs payload",
+                    "success_count": 0,
+                }
 
             challenge_payload = {
                 "id": challenge.id,
@@ -913,14 +941,15 @@ class AsyncChallengeVerifier:
                 ),
             }
 
-            loop = asyncio.get_event_loop()
-            success, verification_details = await loop.run_in_executor(
-                self._executor,
-                _verify_challenge_worker,
-                challenge_payload,
-                proof_data,
-                settings,
-            )
+            if do_offload:
+                loop = asyncio.get_event_loop()
+                success, verification_details = await loop.run_in_executor(
+                    self._executor,
+                    _verify_challenge_worker,
+                    challenge_payload,
+                    proof_data,
+                    settings,
+                )
 
             # Update verification results in database
             verification_time_ms = (time.time() - verification_start_time) * 1000
@@ -969,7 +998,7 @@ class AsyncChallengeVerifier:
                         f"success={success} duration_ms={verification_time_ms:.1f}"
                     )
 
-                    # Remove cached proof for this worker after processing
+                    # Remove cached proof for worker after processing
                     try:
                         cache_key = f"{db_challenge.hotkey}:{db_challenge.worker_id}"
                         self.proof_cache.remove_proof(cache_key)

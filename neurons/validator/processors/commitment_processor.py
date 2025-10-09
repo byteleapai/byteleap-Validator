@@ -241,9 +241,15 @@ class CommitmentProcessor(SynapseProcessor):
                     )  # Only store commitments that pass all checks
 
                     for commitment in commitments:
-                        # Skip CPU commitments in GPU challenges
+                        # Reject CPU sentinel commitments in GPU challenges
                         if commitment.uuid == "-1":
-                            continue
+                            bt.logging.warning(
+                                f"🚨 SECURITY: CPU sentinel commitment received in GPU challenge {challenge_id}"
+                            )
+                            challenge.challenge_status = ChallengeStatus.FAILED
+                            challenge.verification_notes = "Invalid commitment: CPU sentinel submitted for GPU challenge"
+                            session.commit()
+                            return {"error": "Unexpected commitment uuid: -1"}, 1
 
                         # GPU UUID must match heartbeat inventory
                         if commitment.uuid not in valid_gpu_uuids:
@@ -287,6 +293,15 @@ class CommitmentProcessor(SynapseProcessor):
                     bt.logging.info(
                         f"✅ GPU validation | valid_gpus={len(verified_commitments)} inventory={len(valid_gpu_uuids)}"
                     )
+
+                    # If no GPU commitments pass validation, fail fast
+                    if len(verified_commitments) == 0:
+                        challenge.challenge_status = ChallengeStatus.FAILED
+                        challenge.verification_notes = "No valid GPU commitments after signature and inventory checks"
+                        session.commit()
+                        return {
+                            "error": "No valid GPU commitments for this challenge",
+                        }, 1
 
                 # Step 2: Verify worker_id matches original assignment
                 if challenge.worker_id != worker_id:

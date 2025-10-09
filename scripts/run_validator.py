@@ -190,9 +190,6 @@ def setup_logging(config: ConfigManager) -> None:
         utc=False,
     )
 
-    # Set suffix for rotated files (YYYYMMDD format)
-    file_handler.suffix = "%Y%m%d"
-
     # Create formatter
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",

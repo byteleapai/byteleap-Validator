@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import bittensor as bt
 from sqlalchemy import (JSON, Boolean, Column, DateTime, Float, ForeignKey,
-                        Index, Integer, String, Text, create_engine, or_)
+                        Index, Integer, String, Text, create_engine, or_, text)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
@@ -66,6 +66,14 @@ class WorkerInfo(Base):
         Index("idx_worker_hotkey_worker_id", "hotkey", "worker_id", unique=True),
         Index("idx_worker_lease_score", "lease_score"),
         Index("idx_worker_next_heartbeat", "next_heartbeat_deadline"),
+        # Lease ranking per miner (partial)
+        Index(
+            "idx_worker_hotkey_lease_active",
+            "hotkey",
+            "lease_score",
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
     )
 
 
@@ -242,6 +250,13 @@ class GPUInventory(Base):
         Index("idx_gpu_deleted", "deleted_at"),
         Index("idx_gpu_compute_capability", "compute_capability"),
         Index("idx_gpu_architecture", "architecture"),
+        # Partial index: recent active GPUs for window scans
+        Index(
+            "idx_gpu_last_seen_active",
+            "last_seen_at",
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
     )
 
 
@@ -276,6 +291,23 @@ class HeartbeatRecord(Base):
         Index("idx_heartbeat_worker_time", "worker_id", "created_at"),
         Index("idx_heartbeat_created_at", "created_at"),
         Index("idx_heartbeat_deleted", "deleted_at"),
+        # Latest heartbeat per (hotkey, worker)
+        Index(
+            "idx_hb_hotkey_worker_created_active",
+            "hotkey",
+            "worker_id",
+            "created_at",
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+        # Efficient IP-change scan
+        Index(
+            "idx_hb_worker_created_ip_active",
+            "worker_id",
+            "created_at",
+            postgresql_where=text("deleted_at IS NULL"),
+            postgresql_include=["public_ip"],
+        ),
     )
 
 
@@ -329,6 +361,23 @@ class ComputeChallenge(Base):
         Index("idx_challenge_deleted", "deleted_at"),
         Index("idx_challenge_status_created", "challenge_status", "created_at"),
         Index("idx_challenge_hotkey_status", "hotkey", "challenge_status"),
+        # Verification queue ordering (partial)
+        Index(
+            "idx_chal_status_comp_created_active",
+            "challenge_status",
+            "computed_at",
+            "created_at",
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+        # Availability: verified flag + created_at (partial)
+        Index(
+            "idx_chal_verified_created_active",
+            "verification_result",
+            "created_at",
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
     )
 
 
@@ -365,6 +414,13 @@ class MeshHubTask(Base):
         Index("idx_mesh_task_hotkey", "hotkey"),
         Index("idx_mesh_task_status", "status"),
         Index("idx_mesh_task_deleted", "deleted_at"),
+        # Cleanup by created_at (partial)
+        Index(
+            "idx_mesh_task_created_active",
+            "created_at",
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
     )
 
 
@@ -402,6 +458,13 @@ class NetworkWeight(Base):
         Index("idx_weight_applied", "is_applied"),
         Index("idx_weight_applied_at", "applied_at"),
         Index("idx_weight_deleted", "deleted_at"),
+        # Cleanup by created_at (partial)
+        Index(
+            "idx_weight_created_active",
+            "created_at",
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
     )
 
 
@@ -491,16 +554,30 @@ class DatabaseManager:
             self.engine.dispose()
 
     def cleanup_old_data(
-        self, session: Session, retention_days: int = 7
+        self,
+        session: Session,
+        retention_days: int = 7,
+        min_heartbeat_hours: Optional[int] = None,
     ) -> Dict[str, int]:
         """Hard-delete old rows from event/log tables only.
 
         Scope (created_at cutoff):
         - network_logs, heartbeat_records, compute_challenges, meshhub_tasks, network_weights
 
+        Heartbeats use a stricter cutoff to preserve at least the availability window
+        (min_heartbeat_hours), preventing availability calculation bias when retention_days is small.
+
         Returns table_name -> deleted_count
         """
-        cutoff = datetime.utcnow() - timedelta(days=retention_days)
+        now = datetime.utcnow()
+        cutoff = now - timedelta(days=retention_days)
+        # Preserve at least the availability window for heartbeats, if provided
+        if isinstance(min_heartbeat_hours, int) and min_heartbeat_hours > 0:
+            hb_cutoff = now - max(
+                timedelta(days=retention_days), timedelta(hours=min_heartbeat_hours)
+            )
+        else:
+            hb_cutoff = cutoff
         deleted: Dict[str, int] = {}
 
         # Event / history tables (no FK constraints to miner_info)
@@ -516,7 +593,7 @@ class DatabaseManager:
         try:
             deleted["heartbeat_records"] = (
                 session.query(HeartbeatRecord)
-                .filter(HeartbeatRecord.created_at < cutoff)
+                .filter(HeartbeatRecord.created_at < hb_cutoff)
                 .delete(synchronize_session=False)
             )
         except Exception:

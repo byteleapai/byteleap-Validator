@@ -19,6 +19,7 @@ from neurons.validator.services.communication import \
     ValidatorCommunicationService
 from neurons.validator.services.data_cleanup import DataCleanupService
 from neurons.validator.services.meshhub_client import MeshHubClient
+from neurons.validator.services.metagraph_cache import MetagraphCache
 from neurons.validator.services.processor_factory import \
     ValidatorProcessorFactory
 from neurons.validator.services.validation import MinerValidationService
@@ -70,12 +71,17 @@ class Validator:
             )
             raise
 
-        # Initialize metagraph
+        # Initialize metagraph and cache service
         self.metagraph = bt.metagraph(netuid=self.netuid, subtensor=self.subtensor)
+        self.metagraph_cache = MetagraphCache(
+            self.subtensor, self.netuid, self.metagraph, config
+        )
 
         # Database manager
         database_url = self.config.get_non_empty_string("database.url")
         self.database_manager = DatabaseManager(database_url)
+
+        # GPU model allowlist read dynamically from config; no special setup required
 
         # Proof cache for challenge verification data
         from neurons.validator.services.proof_cache import LRUProofCache
@@ -105,6 +111,7 @@ class Validator:
             self.metagraph,
             config,
             meshhub_client=self.meshhub_client,
+            metagraph_cache=self.metagraph_cache,
         )
         # Data retention / cleanup service (startup + nightly)
         try:
@@ -117,9 +124,23 @@ class Validator:
                 f"❌ Config invalid | key=database.event_retention_days error={e}"
             )
             raise
+        # Preserve heartbeats for at least the availability window to avoid bias
+        try:
+            hb_hours = self.config.get_positive_number(
+                "weight_management.availability.window_hours", int
+            )
+        except Exception as e:
+            bt.logging.error(
+                f"❌ Config invalid | key=weight_management.availability.window_hours error={e}"
+            )
+            raise
         self.data_cleanup_service = DataCleanupService(
-            self.database_manager, retention_days=retention_days
+            self.database_manager,
+            retention_days=retention_days,
+            min_heartbeat_hours=hb_hours,
         )
+
+        # Per-protocol rate limiting moved into communication service for centralized control
 
         # Create verification config for async verification service
         self.verification_config = {
@@ -175,11 +196,16 @@ class Validator:
                 # Deferred import to avoid circulars
                 from neurons.validator.models.database import ComputeChallenge
 
-                # Find all VERIFYING challenges (interrupted verification)
+                # Find all VERIFYING/COMMITTED challenges (interrupted verification)
                 interrupted_challenges = (
                     session.query(ComputeChallenge)
                     .filter(
-                        ComputeChallenge.challenge_status == ChallengeStatus.VERIFYING,
+                        ComputeChallenge.challenge_status.in_(
+                            [
+                                ChallengeStatus.VERIFYING,
+                                ChallengeStatus.COMMITTED,
+                            ]
+                        ),
                         ComputeChallenge.deleted_at.is_(None),
                     )
                     .all()
@@ -455,24 +481,46 @@ class Validator:
             blacklist_fn=self._blacklist_session_init,
         )
 
-    def _blacklist_heartbeat(self, synapse: HeartbeatSynapse) -> Tuple[bool, str]:
+    def _is_authorized_hotkey(self, synapse) -> Tuple[bool, str]:
+        try:
+            peer_hotkey = (
+                synapse.dendrite.hotkey if getattr(synapse, "dendrite", None) else None
+            )
+        except Exception:
+            peer_hotkey = None
+
+        if not isinstance(peer_hotkey, str) or not peer_hotkey:
+            return True, "missing_hotkey"
+
+        # Authorize only miners present in current metagraph cache
+        try:
+            if not self.metagraph_cache.is_member(peer_hotkey):
+                return True, "hotkey_not_in_metagraph"
+        except Exception:
+            # Fail safe by not blacklisting if cache access throws unexpectedly
+            return False, ""
+
         return False, ""
 
+    def _blacklist_heartbeat(self, synapse: HeartbeatSynapse) -> Tuple[bool, str]:
+        return self._is_authorized_hotkey(synapse)
+
     def _blacklist_task_request(self, synapse: TaskSynapse) -> Tuple[bool, str]:
-        return False, ""
+        return self._is_authorized_hotkey(synapse)
 
     def _blacklist_challenge_commitment(
         self, synapse: ChallengeSynapse
     ) -> Tuple[bool, str]:
-        return False, ""
+        return self._is_authorized_hotkey(synapse)
 
     def _blacklist_challenge_proof(
         self, synapse: ChallengeProofSynapse
     ) -> Tuple[bool, str]:
-        return False, ""
+        return self._is_authorized_hotkey(synapse)
 
     def _blacklist_session_init(self, synapse: SessionInitSynapse) -> Tuple[bool, str]:
-        return False, ""
+        # Block session handshakes from non‑metagraph hotkeys
+        return self._is_authorized_hotkey(synapse)
 
     async def _handle_heartbeat(self, synapse: HeartbeatSynapse) -> HeartbeatSynapse:
         return await self.communicator.handle_synapse(synapse)
@@ -530,6 +578,10 @@ class Validator:
 
             await self._check_expired_data_on_startup()
 
+            # Start metagraph cache and wait until first successful snapshot
+            await self.metagraph_cache.start()
+            await self.metagraph_cache.wait_until_ready()
+
             await self.meshhub_client.start()
 
             await self.data_cleanup_service.start()
@@ -573,8 +625,8 @@ class Validator:
         await self.weight_manager.stop()
         await self.validation_service.stop()
         await self.meshhub_client.stop()
-
         await self.data_cleanup_service.stop()
+        await self.metagraph_cache.stop()
 
         self.proof_cache.shutdown()
 
@@ -585,8 +637,7 @@ class Validator:
             except asyncio.CancelledError:
                 pass
 
-        if hasattr(self.axon, "stop"):
-            self.axon.stop()
+        self.axon.stop()
         self.database_manager.close()
         self.is_running = False
         self._shutdown_event.set()

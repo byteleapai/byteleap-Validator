@@ -195,15 +195,15 @@ def list_neurons(mg: Any, limit: Optional[int] = None) -> None:
 
     print("\nAll neurons (validators first):")
     print(
-        "UID  HOTKEY                                   STAKE(TAO)   V-PERMIT  VTRUST     EMISSION"
+        "UID  HOTKEY                                                   STAKE(TAO)   V-PERMIT  VTRUST     EMISSION"
     )
     print(
-        "---- ---------------------------------------- ----------- --------- --------- ----------"
+        "---- -------------------------------------------------------- ----------- --------- --------- ----------"
     )
     shown = 0
     for uid, hk, st, vp, vt, em in rows:
         print(
-            f"{uid:>4} {hk[:40]:<40} {_fmt_float(st, 6):>11} {str(vp):>9} {_fmt_float(vt, 4):>9} {_fmt_float(em, 6):>10}"
+            f"{uid:>4} {hk[:48]:<48} {_fmt_float(st, 6):>11} {str(vp):>9} {_fmt_float(vt, 4):>9} {_fmt_float(em, 6):>10}"
         )
         shown += 1
         if limit and shown >= limit:
@@ -256,15 +256,15 @@ def show_validator_assignment(
     block_str = f"block {block}" if block is not None else "latest"
     print(f"\nValidator {validator_uid} → miner weights ({block_str}):")
     print(
-        "TO_UID HOTKEY                                   WEIGHT%    STAKE(TAO)   TRUST       EMISSION"
+        "TO_UID HOTKEY                                           WEIGHT%    STAKE(TAO)   TRUST       EMISSION"
     )
     print(
-        "------ ---------------------------------------- --------- ------------ ----------- ----------"
+        "------ ------------------------------------------------ --------- ------------ ----------- ----------"
     )
     shown = 0
     for to_uid, hk, ratio, st, tr, em in rows:
         print(
-            f"{to_uid:>6} {hk[:40]:<40} {ratio*100:>8.2f}% {_fmt_float(st, 6):>12} {_fmt_float(tr, 6):>11} {_fmt_float(em, 6):>10}"
+            f"{to_uid:>6} {hk[:48]:<48} {ratio*100:>8.2f}% {_fmt_float(st, 6):>12} {_fmt_float(tr, 6):>11} {_fmt_float(em, 6):>10}"
         )
         shown += 1
         if top_k and shown >= top_k:

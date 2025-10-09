@@ -45,7 +45,7 @@ class LRUProofCache:
                         f"cache evicted | key={evicted_key[:12]}... challenge_id={evicted_challenge_id}"
                     )
 
-            # Store new data (will be added at end - most recently used)
+            # Store new data at end (most recently used)
             self._cache[cache_key] = proof_data
 
         bt.logging.debug(

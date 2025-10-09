@@ -21,8 +21,6 @@ from bittensor.utils.weight_utils import (convert_weights_and_uids_for_emit,
 # Add the project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neurons.shared.config.config_manager import ConfigManager
-
 
 class InteractiveWeightTool:
     """Interactive tool for setting miner weights"""
@@ -314,12 +312,13 @@ class InteractiveWeightTool:
         while True:
             try:
                 print("\n📋 Available commands:")
-                print("  1. list [N] - List first N miners (default 10)")
-                print("  2. search <query> - Search miners by hotkey")
-                print("  3. info <uid|hotkey> - Get miner information")
-                print("  4. weight <uid|hotkey> <score> - Set single weight")
-                print("  5. loop - Start continuous scoring loop")
-                print("  6. quit - Exit tool")
+                print("  - list [N] - List first N miners (default 10)")
+                print("  - search <query> - Search miners by hotkey")
+                print("  - info <uid|hotkey> - Get miner information")
+                print("  - weight <uid|hotkey> <score> - Set single weight")
+                print("  - loop - Start continuous scoring loop")
+                print("  - axon <ip> <port> - Update on-chain axon address")
+                print("  - quit - Exit tool")
 
                 cmd = input("\n> ").strip().split()
                 if not cmd:
@@ -383,6 +382,29 @@ class InteractiveWeightTool:
                     else:
                         print(f"❌ Miner not found: {identifier}")
 
+                elif action == "axon":
+                    if len(cmd) < 2:
+                        print("❌ Usage: axon <ip> [port]")
+                        continue
+                    ip = cmd[1]
+
+                    port: Optional[int] = None
+                    if len(cmd) >= 3:
+                        try:
+                            port = int(cmd[2])
+                            # Allow 0..65535 inclusive. Port 0 is allowed for on-chain broadcast.
+                            if not (0 <= port <= 65535):
+                                print("❌ Port must be in 0-65535")
+                                continue
+                        except ValueError:
+                            print("❌ Invalid port value")
+                            continue
+
+                    try:
+                        asyncio.run(self.update_axon_onchain(ip, port))
+                    except Exception as e:
+                        print(f"❌ Failed to update axon: {e}")
+
                 elif action == "loop":
                     self._run_loop_setup()
 
@@ -396,53 +418,139 @@ class InteractiveWeightTool:
 
         print("\n👋 Goodbye!")
 
+    async def update_axon_onchain(self, ip: str, port: int) -> None:
+        """Update on-chain axon endpoint for current hotkey"""
+        try:
+            bt.logging.info(
+                f"🛰️ Updating axon | ip={ip} port={port} netuid={self.netuid}"
+            )
+
+            # Set desired external address and push to chain
+            # Important: chain uses external_ip for on-chain endpoint, not bind ip.
+            # Passing external_ip ensures on-chain value matches provided ip (e.g., 0.0.0.0).
+            ax = bt.axon(wallet=self.wallet, port=port, external_ip=ip)
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: ax.serve(netuid=self.netuid, subtensor=self.subtensor)
+            )
+
+            # Refresh mapping
+            try:
+                self.metagraph.sync(subtensor=self.subtensor)
+            except Exception:
+                pass
+
+            # Show result
+            try:
+                my_hotkey = getattr(
+                    self.wallet.hotkey, "ss58_address", None
+                ) or getattr(self.wallet.hotkey, "address", None)
+                uid = (
+                    self.metagraph.hotkeys.index(my_hotkey)
+                    if my_hotkey in self.metagraph.hotkeys
+                    else None
+                )
+                if uid is not None and 0 <= uid < len(self.metagraph.axons):
+                    ep = self.metagraph.axons[uid]
+                    ep_ip = getattr(ep, "ip", ip)
+                    ep_port = getattr(ep, "port", port)
+                    print(f"✅ Axon updated on-chain → {ep_ip}:{ep_port} (uid {uid})")
+                else:
+                    print("✅ Axon update extrinsic submitted")
+            except Exception:
+                print("✅ Axon update extrinsic submitted")
+
+        except Exception as e:
+            bt.logging.error(f"❌ Axon update failed | error={e}")
+            raise
+
     def _run_loop_setup(self) -> None:
         """Interactive setup for continuous scoring loop"""
         print("\n🔄 Continuous Scoring Loop Setup")
         print("-" * 40)
 
-        target_miners = []
+        # Choose mode
+        try:
+            mode = (
+                input("Mode [manual/mimic] (default manual): ").strip().lower()
+                or "manual"
+            )
+        except (KeyboardInterrupt, EOFError):
+            print("\n❌ Setup cancelled")
+            return
 
-        print("Enter target miners (one per line). Format: <uid|hotkey> <weight>")
-        print("Type 'done' when finished:")
+        if mode not in ("manual", "mimic"):
+            print("❌ Invalid mode. Use 'manual' or 'mimic'.")
+            return
 
-        while True:
-            try:
-                line = input("Miner > ").strip()
-                if line.lower() == "done":
-                    break
+        if mode == "manual":
+            target_miners = []
 
-                parts = line.split()
-                if len(parts) != 2:
-                    print("❌ Format: <uid|hotkey> <weight>")
-                    continue
+            print("Enter target miners (one per line). Format: <uid|hotkey> <weight>")
+            print("Type 'done' when finished:")
 
-                identifier = parts[0]
+            while True:
                 try:
-                    weight = float(parts[1])
-                    if not 0.0 <= weight <= 1.0:
-                        print("❌ Weight must be between 0.0 and 1.0")
+                    line = input("Miner > ").strip()
+                    if line.lower() == "done":
+                        break
+
+                    parts = line.split()
+                    if len(parts) != 2:
+                        print("❌ Format: <uid|hotkey> <weight>")
                         continue
-                except ValueError:
-                    print("❌ Invalid weight value")
-                    continue
 
-                uid = self.get_miner_uid(identifier)
-                if uid is not None:
-                    target_miners.append({"uid": uid, "weight": weight})
-                    info = self.get_miner_info(uid)
-                    print(
-                        f"✅ Added UID {uid}: {info.get('hotkey', 'Unknown')[:20]}... -> {weight:.6f}"
-                    )
-                else:
-                    print(f"❌ Miner not found: {identifier}")
+                    identifier = parts[0]
+                    try:
+                        weight = float(parts[1])
+                        if not 0.0 <= weight <= 1.0:
+                            print("❌ Weight must be between 0.0 and 1.0")
+                            continue
+                    except ValueError:
+                        print("❌ Invalid weight value")
+                        continue
 
-            except (KeyboardInterrupt, EOFError):
-                print("\n❌ Setup cancelled")
+                    uid = self.get_miner_uid(identifier)
+                    if uid is not None:
+                        target_miners.append({"uid": uid, "weight": weight})
+                        info = self.get_miner_info(uid)
+                        print(
+                            f"✅ Added UID {uid}: {info.get('hotkey', 'Unknown')[:20]}... -> {weight:.6f}"
+                        )
+                    else:
+                        print(f"❌ Miner not found: {identifier}")
+
+                except (KeyboardInterrupt, EOFError):
+                    print("\n❌ Setup cancelled")
+                    return
+
+            if not target_miners:
+                print("❌ No target miners specified")
                 return
 
-        if not target_miners:
-            print("❌ No target miners specified")
+            try:
+                interval = int(input("Interval (seconds): "))
+                if interval <= 0:
+                    print("❌ Interval must be positive")
+                    return
+            except (ValueError, KeyboardInterrupt, EOFError):
+                print("❌ Invalid interval")
+                return
+
+            asyncio.run(self.continuous_scoring_loop(target_miners, interval))
+            return
+
+        # Mimic mode
+        try:
+            validator_identifier = input("Validator to mimic (uid or hotkey): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n❌ Setup cancelled")
+            return
+
+        validator_uid = self.get_miner_uid(validator_identifier)
+        if validator_uid is None:
+            print(f"❌ Validator not found: {validator_identifier}")
             return
 
         try:
@@ -454,8 +562,216 @@ class InteractiveWeightTool:
             print("❌ Invalid interval")
             return
 
-        # Run the continuous loop
-        asyncio.run(self.continuous_scoring_loop(target_miners, interval))
+        tempo_blocks: Optional[int] = None
+        try:
+            tempo_in = input(
+                "Chain tempo blocks [105 to respect updates, blank to skip]: "
+            ).strip()
+            if tempo_in:
+                tempo_blocks = int(tempo_in)
+                if tempo_blocks <= 0:
+                    print("❌ Tempo must be positive if provided")
+                    return
+        except (ValueError, KeyboardInterrupt, EOFError):
+            print("❌ Invalid tempo value")
+            return
+
+        asyncio.run(self.continuous_mimic_loop(validator_uid, interval, tempo_blocks))
+
+    async def _fetch_validator_latest_weights(
+        self, validator_uid: int
+    ) -> Dict[str, float]:
+        """Read chain weights for a validator and return hotkey→weight ratio"""
+        # Ensure metagraph is reasonably fresh for uid→hotkey mapping
+        try:
+            self.metagraph.sync(subtensor=self.subtensor)
+        except Exception:
+            pass
+
+        # Read full weight map for subnet
+        try:
+            loop = asyncio.get_event_loop()
+            all_weights = await loop.run_in_executor(
+                None,
+                lambda: self.subtensor.weights(netuid=self.netuid, block=None),
+            )
+        except Exception as e:
+            bt.logging.error(f"❌ Failed to read on-chain weights | error={e}")
+            return {}
+
+        # Find the validator entry
+        entry: Optional[Tuple[int, List[Tuple[int, int]]]] = None
+        for vid, pairs in all_weights:
+            if int(vid) == int(validator_uid):
+                entry = (vid, pairs or [])
+                break
+
+        if not entry:
+            bt.logging.warning("⚠️ No weights found for validator")
+            return {}
+
+        _, to_pairs = entry
+        if not to_pairs:
+            return {}
+
+        total = sum(int(w) for _, w in to_pairs) or 1
+        hotkeys = [ax.hotkey for ax in self.metagraph.axons]
+
+        result: Dict[str, float] = {}
+        for to_uid, w in to_pairs:
+            uid = int(to_uid)
+            if 0 <= uid < len(hotkeys):
+                result[hotkeys[uid]] = float(int(w)) / float(total)
+        return result
+
+    async def _fetch_validator_uint_pairs(
+        self, validator_uid: int
+    ) -> Tuple[List[int], List[int]]:
+        """Fetch the exact on-chain integer weight pairs for a validator (uids, uint16 weights)."""
+        try:
+            loop = asyncio.get_event_loop()
+            all_weights = await loop.run_in_executor(
+                None,
+                lambda: self.subtensor.weights(netuid=self.netuid, block=None),
+            )
+        except Exception as e:
+            bt.logging.error(f"❌ Failed to read on-chain weights | error={e}")
+            return [], []
+
+        entry: Optional[Tuple[int, List[Tuple[int, int]]]] = None
+        for vid, pairs in all_weights:
+            if int(vid) == int(validator_uid):
+                entry = (vid, pairs or [])
+                break
+
+        if not entry:
+            return [], []
+
+        _, to_pairs = entry
+        if not to_pairs:
+            return [], []
+
+        uids: List[int] = []
+        weights: List[int] = []
+        for to_uid, w in to_pairs:
+            uids.append(int(to_uid))
+            weights.append(int(w))
+        return uids, weights
+
+    async def _apply_uint_weights_exact(
+        self, uids: List[int], uint_weights: List[int]
+    ) -> bool:
+        """Submit exact uint weights without re-normalization (for perfect mimic)."""
+        try:
+            if not uids or not uint_weights or len(uids) != len(uint_weights):
+                bt.logging.warning("⚠️ No valid uint weights to set")
+                return False
+
+            import numpy as np
+
+            nuids = np.array(uids, dtype=np.uint64)
+            nwts = np.array(uint_weights, dtype=np.uint16)
+
+            async with self._subtensor_lock:
+                loop = asyncio.get_event_loop()
+                result, msg = await loop.run_in_executor(
+                    None,
+                    lambda: self.subtensor.set_weights(
+                        wallet=self.wallet,
+                        netuid=self.netuid,
+                        uids=nuids,
+                        weights=nwts,
+                        wait_for_inclusion=False,
+                        wait_for_finalization=False,
+                        version_key=0,
+                    ),
+                )
+
+            if result:
+                bt.logging.info(f"✅ Weights set (exact) | miners={len(uids)}")
+                return True
+            else:
+                bt.logging.error(f"❌ Weight submission failed | msg={msg}")
+                return False
+        except Exception as e:
+            bt.logging.error(f"❌ Exact weights submit error | error={e}")
+            return False
+
+    async def continuous_mimic_loop(
+        self,
+        validator_uid: int,
+        interval_seconds: int,
+        tempo_blocks: Optional[int] = None,
+    ) -> None:
+        """Continuously mirror another validator's on-chain weights"""
+        print(f"\n🪞 Mimic mode | validator_uid={validator_uid}")
+        print(f"⏰ Press Ctrl+C to stop the loop\n")
+
+        epoch = 0
+        try:
+            while True:
+                epoch += 1
+                print(f"🎯 Epoch {epoch} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+                weights_map = await self._fetch_validator_latest_weights(validator_uid)
+                if not weights_map:
+                    print("⚠️ No weights to apply this epoch")
+                else:
+                    # Respect on-chain update tempo if provided
+                    if tempo_blocks is not None:
+                        try:
+                            my_hotkey = getattr(
+                                self.wallet.hotkey, "ss58_address", None
+                            ) or getattr(self.wallet.hotkey, "address", None)
+                            my_uid = (
+                                self.metagraph.hotkeys.index(my_hotkey)
+                                if my_hotkey in self.metagraph.hotkeys
+                                else None
+                            )
+                            if my_uid is not None:
+                                loop = asyncio.get_event_loop()
+                                blocks_since_last = await loop.run_in_executor(
+                                    None,
+                                    lambda: self.subtensor.blocks_since_last_update(
+                                        self.netuid, my_uid
+                                    ),
+                                )
+                                if int(blocks_since_last) < int(tempo_blocks):
+                                    print(
+                                        f"⏭️ Skip submit | tempo={tempo_blocks} last={blocks_since_last}"
+                                    )
+                                    print(f"⏱️ Waiting {interval_seconds} seconds...")
+                                    await asyncio.sleep(interval_seconds)
+                                    continue
+                        except Exception as e:
+                            bt.logging.warning(
+                                f"⚠️ Tempo check failed | error={e} proceeding_without_gate"
+                            )
+
+                    # Prefer exact integer replication to avoid rounding drift
+                    uids_exact, wts_exact = await self._fetch_validator_uint_pairs(
+                        validator_uid
+                    )
+                    success = False
+                    if uids_exact and wts_exact:
+                        success = await self._apply_uint_weights_exact(
+                            uids_exact, wts_exact
+                        )
+                    if not success:
+                        # Fallback to normalized float path
+                        success = await self._apply_weights_to_network(weights_map)
+                    if success:
+                        print(
+                            f"✅ Epoch {epoch} complete | mimicked {len(weights_map)} miners"
+                        )
+                    else:
+                        print("❌ Epoch failed | weight submission error")
+
+                print(f"⏱️ Waiting {interval_seconds} seconds...")
+                await asyncio.sleep(interval_seconds)
+
+        except KeyboardInterrupt:
+            print(f"\n🛑 Stopping mimic loop after {epoch} epochs")
 
 
 def main():
@@ -487,11 +803,11 @@ def main():
             print("❌ Invalid network. Use: finney, test, or local")
             return
 
-        debug_input = input("Enable debug logging? (y/n): ").strip().lower()
-        debug = debug_input in ["y", "yes", "1", "true"]
+        # debug_input = input("Enable debug logging? (y/n): ").strip().lower()
+        # debug = debug_input in ["y", "yes", "1", "true"]
 
-        if debug:
-            bt.logging.set_debug(True)
+        # if debug:
+        bt.logging.set_debug(True)
 
         print()
         tool = InteractiveWeightTool(wallet_name, hotkey_name, netuid, network)

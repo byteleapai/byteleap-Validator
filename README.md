@@ -7,17 +7,18 @@ ByteLeap Validator is the network coordination node for Bittensor SN128, managin
 **Validator Responsibilities:**
 - **Challenge Validation**: Two-phase verification protocol for computational integrity
 - **Weight Management**: Network-wide scoring and weight updates
-- **Resource Tracking**: PostgreSQL-based miner and worker performance monitoring
+- **Resource & Lease Tracking**: PostgreSQL-based miner and worker performance monitoring
 - **Secure Communication**: Session-based encryption with miners
+- **VM Gateway Enrollment Brokering**: Retrieves, caches, and serves VM gateway enroll tokens from MeshHub to miners
 
 ## Scoring System
 
 The validator manages a dual-factor scoring system for network participants:
 
 ### Score Components (Weighted)
-- **Lease Revenue** (70%): Active compute rentals generate the primary score
-- **Challenge Performance** (30%): Computational benchmarks for idle workers
-- **Availability Multiplier**: Based on 169-hour online presence
+- **Lease Revenue**: Active compute rentals generate the primary score
+- **Challenge Performance**: Computational benchmarks for idle workers
+- **Availability Multiplier**: Scales challenge output using the configured uptime window
 
 ### How Scoring Works
 
@@ -35,9 +36,9 @@ The validator manages a dual-factor scoring system for network participants:
 - Rewards consistent participation over peak performance
 
 **Worker Management**
-- Maximum 100 workers per miner
+- Weight aggregation considers only a capped worker set per miner
 - Challenges target only unleased workers
-- Final score sums all worker performance (capped at 100)
+- Final score sums all eligible worker performance while respecting the per-miner cap
 
 ## Quick Start
 
@@ -68,6 +69,8 @@ Configure your validator in `config/validator_config.yaml`:
 - Database connection parameters
 - Challenge verification settings
 - Weight update intervals
+- MeshHub connectivity (`meshhub.ws_url`, `meshhub.access_token`, capabilities)
+- Security controls such as rate limiting and proof cache size
 
 ### Running the Validator
 
@@ -88,39 +91,40 @@ python scripts/run_validator.py --config config/validator_config.yaml
 ## Technical Architecture
 
 ```
-┌────────────────────────┐                       ┌───────────────────┐
-│      Validator         │       Encrypted       │       Miner       │
-│     (Bittensor)        │ ←── Communication ─── │    (Bittensor)    │
-│                        │    (via bittensor)    │                   │
-│ • Challenge Creation   │                       │ • Worker Mgmt.    │
-│ • Score Validation     │                       │ • Resource Agg.   │
-│ • Weight Calculation   │                       │ • Task Routing    │
-└────────────────────────┘                       └───────────────────┘
-                                                          ↑
-                                                          │ WebSocket
-                                                          │
-                                               ┌───────────────────────┐
-                                               │      Worker(s)        │
-                                               │                       │
-                                               │ • System Monitoring   │
-                                               │ • Challenge Execution │
-                                               │ • Compute Tasks       │
-                                               └───────────────────────┘
+┌────────────────────────┐                       ┌───────────────────┐                   ┌────────────────────────┐
+│       Validator        │                       │       Miner       │                   │       Worker(s)        │
+│      (Bittensor)       │       Encrypted       │    (Bittensor)    │                   │                        │
+│                        │ ←── Communication ─── │                   │ ←── WebSocket ──→ │ • System Monitoring    │
+│ • Challenge Creation   │    (via bittensor)    │ • Worker Mgmt.    │      (1 : N)      │ • Challenge Execution  │
+│ • Score Validation     │                       │ • Resource Agg.   │                   │ • VMGW Session         │
+│ • Weight Calculation   │                       │ • Task Routing    │                   │ • Libvirt Mgmt.        │
+└────────────────────────┘                       └───────────────────┘                   └────────────────────────┘
 ```
 
 ### Core Components
 
 **Validator Core** (`neurons/validator/`)
-- `core/validator.py` - Main validator orchestration
-- `services/validation.py` - Challenge validation engine
-- `services/weight_manager.py` - Weight calculation and network updates
+- `core/validator.py` - Main validator orchestration, MeshHub client wiring, Axon handlers
+- `services/validation.py` - Challenge validation engine with GPU allowlist enforcement
+- `services/weight_manager.py` - Weight calculation, metagraph gating, subtensor guard integration
 - `services/async_challenge_verifier.py` - Asynchronous proof verification
+- `services/communication.py` - Encrypted synapse routing with per-hotkey rate limiting
+- `services/data_cleanup.py` - Nightly retention and availability-safe pruning
 
 **Database Models** (`neurons/validator/models/`)
 - `MinerInfo` - Miner registration and weight tracking
-- `WorkerInfo` - Individual worker performance metrics
+- `WorkerInfo` - Individual worker performance metrics (lease sync, availability)
 - `ComputeChallenge` - Challenge tracking with verification state
 - `NetworkWeight` - Historical weight calculations
+- `GPUInventory` - GPU fingerprinting and allowlist checks
+- `HeartbeatRecord` - Worker heartbeat history retained per policy
+
+## Operational Services
+
+- **MeshHub WebSocket**: Streams heartbeats, resource reports, lease updates, and VM gateway token responses over an encrypted session with cached retries.
+- **Proof Cache**: `validation.proof_queue_max_size` bounds in-memory proofs; evictions trigger cleanup to avoid dangling verifications.
+- **Rate Limiter**: `security.rate_limit.*` defines the sliding window used to throttle abusive miners before synapse handlers run expensive work.
+- **Data Cleanup**: Retention windows ensure historical tables stay within size targets while preserving the availability horizon used for scoring.
 
 ## Development
 

@@ -83,7 +83,7 @@ def migrate_to_head_if_needed(
     # Bootstrap if no revision and no tables
     try:
         if current_rev is None and not existing_tables:
-            bt.logging.info("🧱 Bootstrap DB schema from models (empty database)")
+            bt.logging.info("🚀 Bootstrap DB schema from models (empty database)")
             engine = create_engine(database_url)
             Base.metadata.create_all(bind=engine)
             engine.dispose()
@@ -116,7 +116,7 @@ def migrate_to_head_if_needed(
             bt.logging.info(
                 f"⛏️ DB migrate required | from={current_rev} -> to={head_rev}"
             )
-        bt.logging.info(f"📦 Ensuring DB at head | url={safe_db}")
+        bt.logging.info(f"🚀 Ensuring DB at head | url={safe_db}")
         command.upgrade(cfg, "head")
         bt.logging.info("✅ DB schema confirmed at head")
         return True

@@ -3,6 +3,7 @@ Validator Commitment Processor
 Handles Phase 1 of two-phase verification: commitment submission and row selection
 """
 
+import asyncio
 import base64
 import binascii
 import secrets
@@ -145,39 +146,42 @@ class CommitmentProcessor(SynapseProcessor):
         self.config = config
 
     def _get_cpu_row_count(self) -> int:
-        return int(
-            self.config.get("validation.cpu.verification.row_verification_count")
+        return self.config.get_positive_number(
+            "validation.cpu.verification.row_verification_count", int
         )
 
     def _get_cpu_row_variance(self) -> float:
-        return float(
-            self.config.get(
-                "validation.cpu.verification.row_verification_count_variance"
-            )
+        return self.config.get_range(
+            "validation.cpu.verification.row_verification_count_variance",
+            0.0,
+            1.0,
+            float,
         )
 
     def _get_gpu_coord_count(self) -> int:
-        return int(
-            self.config.get("validation.gpu.verification.coordinate_sample_count")
+        return self.config.get_positive_number(
+            "validation.gpu.verification.coordinate_sample_count", int
         )
 
     def _get_gpu_coord_variance(self) -> float:
-        return float(
-            self.config.get(
-                "validation.gpu.verification.coordinate_sample_count_variance"
-            )
+        return self.config.get_range(
+            "validation.gpu.verification.coordinate_sample_count_variance",
+            0.0,
+            1.0,
+            float,
         )
 
     def _get_gpu_row_count(self) -> int:
-        return int(
-            self.config.get("validation.gpu.verification.row_verification_count")
+        return self.config.get_positive_number(
+            "validation.gpu.verification.row_verification_count", int
         )
 
     def _get_gpu_row_variance(self) -> float:
-        return float(
-            self.config.get(
-                "validation.gpu.verification.row_verification_count_variance"
-            )
+        return self.config.get_range(
+            "validation.gpu.verification.row_verification_count_variance",
+            0.0,
+            1.0,
+            float,
         )
 
     @property
@@ -196,6 +200,14 @@ class CommitmentProcessor(SynapseProcessor):
         """
         Process a unified commitment submission (Phase 1).
         """
+        return await asyncio.to_thread(
+            self._process_request_sync, commitment_data, peer_hotkey
+        )
+
+    def _process_request_sync(
+        self, commitment_data: CommitmentData, peer_hotkey: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Blocking commitment processing executed in worker threads."""
         try:
             challenge_id = commitment_data.challenge_id
             worker_id = commitment_data.worker_id

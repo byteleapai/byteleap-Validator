@@ -222,7 +222,7 @@ def setup_logging(config: ConfigManager) -> None:
     # Alembic migration logs at INFO are usually sufficient
     logging.getLogger("alembic").setLevel(logging.INFO)
 
-    bt.logging.info(f"🧾 File logging | path={log_filepath} | level={log_level}")
+    bt.logging.info(f"File logging | path={log_filepath} | level={log_level}")
 
 
 def setup_environment(config: ConfigManager) -> None:
@@ -260,7 +260,7 @@ async def perform_startup_update_check() -> bool:
         bool: True if an update was performed and restart is needed, False otherwise
     """
     try:
-        bt.logging.info("🔍 Performing startup update check")
+        bt.logging.info("Performing startup update check")
 
         # Check if we just restarted due to an update (prevent infinite loops)
         restart_marker_file = project_root / ".update_restart_marker"
@@ -280,8 +280,8 @@ async def perform_startup_update_check() -> bool:
         update_performed = await updater.check_and_update()
 
         if update_performed:
-            bt.logging.info("🎉 Update completed successfully!")
-            bt.logging.info("📝 IMPORTANT: Restarting to use new code")
+            bt.logging.info("✅ Update completed successfully!")
+            bt.logging.info("IMPORTANT: Restarting to use new code")
 
             # Create marker file to indicate we're restarting due to update
             restart_marker_file.write_text(
@@ -308,7 +308,7 @@ def restart_validator_process():
     This function will exec a new process replacing the current one
     """
     try:
-        bt.logging.info("🔄 Restarting validator process with updated code")
+        bt.logging.info("Restarting validator process with updated code")
 
         # Get current command line arguments
         current_args = sys.argv.copy()
@@ -323,8 +323,8 @@ def restart_validator_process():
         bt.logging.info(
             f"🚀 Restarting in current terminal: {' '.join(restart_command)}"
         )
-        bt.logging.info(f"📁 Working directory: {project_root}")
-        bt.logging.info(f"🐍 Python executable: {python_executable}")
+        bt.logging.info(f"Working directory: {project_root}")
+        bt.logging.info(f"Python executable: {python_executable}")
 
         # Flush all logs before restart
         import logging
@@ -339,14 +339,14 @@ def restart_validator_process():
 
         # Use os.execv to replace current process (Unix/Linux style restart)
         if hasattr(os, "execv"):
-            bt.logging.info("🔄 Using os.execv to restart process")
+            bt.logging.info("Using os.execv to restart process")
             # Change to project directory
             os.chdir(str(project_root))
             # Replace current process with new one
             os.execv(python_executable, restart_command)
         else:
             # Fallback for Windows or systems without execv
-            bt.logging.info("🔄 Using subprocess.call for restart")
+            bt.logging.info("Using subprocess.call for restart")
             os.chdir(str(project_root))
             # Exit current process and start new one
             exit_code = subprocess.call(restart_command)
@@ -354,7 +354,7 @@ def restart_validator_process():
 
     except Exception as e:
         bt.logging.error(f"❌ Failed to restart validator process: {e}")
-        bt.logging.error("📝 Please restart manually to use updated code")
+        bt.logging.error("❌ Please restart manually to use updated code")
         # Continue with current process if restart fails
         bt.logging.warning(
             "⚠️ Continuing with current process (updated code will be used on next manual restart)"
@@ -387,17 +387,17 @@ async def main():
     setup_environment(config)
 
     # Display configuration information
-    bt.logging.info(f"🌐 Netuid | id={config.get('netuid')}")
-    bt.logging.info(f"🔌 Port | port={config.get('port')}")
-    bt.logging.info(f"👛 Wallet | name={config.get('wallet.name')}")
-    bt.logging.info(f"🔑 Hotkey | name={config.get('wallet.hotkey')}")
+    bt.logging.info(f"Netuid | id={config.get('netuid')}")
+    bt.logging.info(f"Port | port={config.get('port')}")
+    bt.logging.info(f"Wallet | name={config.get('wallet.name')}")
+    bt.logging.info(f"Hotkey | name={config.get('wallet.hotkey')}")
     database_url = config.get("database.url")
     safe_db_url = database_url.split("@")[-1] if "@" in database_url else database_url
     bt.logging.info(f"DB | url={safe_db_url}")
     bt.logging.debug(f"Log level | level={config.get('logging.log_level')}")
 
     # Check database connection
-    bt.logging.info("🔎 Checking database connection")
+    bt.logging.info("Checking database connection")
     if not check_database_connection(config.get("database.url")):
         bt.logging.error(
             "❌ DB connect failed | ensure PostgreSQL is running and configured"
@@ -410,27 +410,21 @@ async def main():
         return
 
     # Perform startup update check (unless disabled)
-    update_check_enabled = config.get_optional(
-        "auto_update.enabled", True
-    )  # Default to enabled
-    if not args.no_auto_update and update_check_enabled:
+    if not args.no_auto_update:
         bt.logging.info("🚀 Starting automatic update check")
         update_performed = await perform_startup_update_check()
 
         if update_performed:
-            bt.logging.info("🔄 Update completed - restarting validator with new code")
+            bt.logging.info("Update completed - restarting validator with new code")
             # Restart the current process via Python native exec (no external manager required)
             restart_validator_process()
             # This line should never be reached due to os.execv in restart_validator_process()
             return
     else:
-        if args.no_auto_update:
-            bt.logging.info("⏭️ Automatic updates disabled via command line")
-        else:
-            bt.logging.info("⏭️ Automatic updates disabled in configuration")
+        bt.logging.info("Automatic updates disabled via command line")
 
     # Ensure database schema is up-to-date before service starts
-    bt.logging.info("🛠️ Ensuring database schema is current")
+    bt.logging.info("Ensuring database schema is current")
     ok = migrate_to_head_if_needed(database_url, config_path=args.config)
     if not ok:
         bt.logging.error("❌ Database migration failed; aborting startup")
@@ -456,7 +450,7 @@ async def main():
         await validator.run()
 
     except KeyboardInterrupt:
-        bt.logging.info("⏹️ Interrupt | shutting down")
+        bt.logging.info("Validator interrupt | shutting down")
         if validator and validator.is_running:
             try:
                 await asyncio.wait_for(validator.stop(), timeout=10.0)

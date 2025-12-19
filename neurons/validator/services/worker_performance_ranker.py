@@ -79,6 +79,15 @@ class WorkerPerformanceRanker:
         self._cache_capacity = 2000
         self._cache_keep = int(self._cache_capacity * 0.8)
 
+        # Database dialect cache (None = not yet detected)
+        self._db_dialect: Optional[str] = None
+
+    def _is_postgres(self, session) -> bool:
+        """Check if using PostgreSQL, with caching."""
+        if self._db_dialect is None:
+            self._db_dialect = session.bind.dialect.name or ""
+        return self._db_dialect == "postgresql"
+
     def calculate_worker_performance(
         self, evaluation_window_minutes: int
     ) -> Dict[str, WorkerPerformanceScore]:
@@ -95,6 +104,7 @@ class WorkerPerformanceRanker:
         bt.logging.info(
             f"Calculating worker performance | window={evaluation_window_minutes}m"
         )
+        t_perf_start = time.monotonic()
 
         with self.db_manager.get_session() as session:
             cutoff_time = datetime.utcnow() - timedelta(
@@ -116,6 +126,7 @@ class WorkerPerformanceRanker:
             )
 
             # Get all recent challenges, considering only those that passed two-phase verification
+            t_ch_start = time.monotonic()
             all_challenges = (
                 session.query(ComputeChallenge)
                 .filter(
@@ -126,6 +137,9 @@ class WorkerPerformanceRanker:
                 .order_by(ComputeChallenge.created_at.desc())
                 .all()
             )
+            bt.logging.debug(
+                f"Challenges query | count={len(all_challenges)} elapsed={time.monotonic()-t_ch_start:.2f}s"
+            )
 
             if not all_challenges:
                 bt.logging.warning("No recent challenges found for scoring")
@@ -133,6 +147,7 @@ class WorkerPerformanceRanker:
 
             bt.logging.debug(f"Processing {len(all_challenges)} recent challenges")
             worker_stats = {}
+            gil_release_counter = 0
 
             # Build GPU uuid -> canonical hotkey map from inventory
             uuid_owner_map: Dict[str, str] = {}
@@ -217,20 +232,22 @@ class WorkerPerformanceRanker:
                     )
                     # Keep only aggregate counts; last success_count not needed
 
+                # Release GIL periodically to allow other threads to execute
+                gil_release_counter += 1
+                if gil_release_counter % 100 == 0:
+                    time.sleep(0.05)
+
             # Compute per-worker availability over configured window
-            worker_availability: Dict[str, float] = {}
-            try:
-                worker_availability = self._compute_worker_availability(
-                    session=session,
-                    hours=self.availability_window_hours,
-                    limit_to_worker_keys=set(worker_stats.keys()),
-                    consistency_minutes=evaluation_window_minutes,
-                )
-            except Exception as e:
-                bt.logging.warning(
-                    f"⚠️ Worker availability compute failed | error={e} using_ones"
-                )
-                worker_availability = {k: 1.0 for k in worker_stats.keys()}
+            t_avail_start = time.monotonic()
+            worker_availability: Dict[str, float] = self._compute_worker_availability(
+                session=session,
+                hours=self.availability_window_hours,
+                limit_to_worker_keys=set(worker_stats.keys()),
+                consistency_minutes=evaluation_window_minutes,
+            )
+            bt.logging.debug(
+                f"Availability calc | workers={len(worker_availability)} elapsed={time.monotonic()-t_avail_start:.2f}s"
+            )
 
             # Calculate metrics and absolute scores for each worker
             workers_for_ordering = []
@@ -344,12 +361,11 @@ class WorkerPerformanceRanker:
         limit_to_worker_keys: Optional[set] = None,
         consistency_minutes: int = 180,
     ) -> Dict[str, float]:
-        """Compute per-worker availability over a window using hotkey-level GPU presence union and per-worker IP penalty.
+        """Compute per-worker availability using SQL aggregation.
 
         Returns: ("{hotkey}_{worker_id}") -> availability in [0,1]
         """
-        from neurons.validator.models.database import (ComputeChallenge,
-                                                       HeartbeatRecord)
+        from sqlalchemy import bindparam, text
 
         if hours <= 0:
             return {k: 1.0 for k in (limit_to_worker_keys or [])}
@@ -377,120 +393,303 @@ class WorkerPerformanceRanker:
             return cached_results
 
         window_start = datetime.utcnow() - timedelta(hours=hours)
+        expected_intervals = max(1, int(hours * 12))  # 5-min buckets
 
-        q = (
-            session.query(HeartbeatRecord)
-            .filter(HeartbeatRecord.created_at >= window_start)
-            .filter(HeartbeatRecord.deleted_at.is_(None))
-            .order_by(HeartbeatRecord.created_at.asc(), HeartbeatRecord.id.asc())
-        )
-        records = q.all()
-
-        by_worker: Dict[str, List[HeartbeatRecord]] = {}
-        by_hotkey_bucket_uuids: Dict[str, Dict[int, set]] = {}
-        needed_hotkeys: Optional[set] = None
+        # Extract hotkeys we need for filtering
+        needed_hotkeys: Optional[List[str]] = None
         if limit_to_worker_keys:
-            needed_hotkeys = {k.split("_", 1)[0] for k in limit_to_worker_keys}
+            needed_hotkeys = list({k.split("_", 1)[0] for k in limit_to_worker_keys})
 
-        for r in records:
-            if not r.hotkey:
+        is_postgres = self._is_postgres(session)
+
+        # SQL aggregation: bucket counts and IP changes per worker
+        t_sql_start = time.monotonic()
+        worker_stats: Dict[str, Tuple[int, int]] = {}
+
+        params: Dict[str, Any] = {"window_start": window_start}
+        hotkey_filter = ""
+        if needed_hotkeys:
+            hotkey_filter = "AND hotkey IN :hotkeys"
+            params["hotkeys"] = tuple(needed_hotkeys)
+
+        bucket_expr = (
+            "CAST(EXTRACT(EPOCH FROM created_at) / 300 AS INTEGER)"
+            if is_postgres
+            else "CAST(strftime('%s', created_at) / 300 AS INTEGER)"
+        )
+
+        # Match master branch behavior: skip NULL IPs when computing IP changes
+        # but include all records for bucket counting
+        sql = text(
+            f"""
+            WITH all_heartbeats AS (
+                SELECT
+                    hotkey,
+                    worker_id,
+                    public_ip,
+                    ({bucket_expr}) AS bucket
+                FROM heartbeat_records
+                WHERE created_at >= :window_start
+                    AND deleted_at IS NULL
+                    {hotkey_filter}
+            ),
+            non_null_ips AS (
+                SELECT
+                    hotkey,
+                    worker_id,
+                    public_ip,
+                    LAG(public_ip) OVER (PARTITION BY hotkey, worker_id ORDER BY created_at, id) AS prev_ip
+                FROM heartbeat_records
+                WHERE created_at >= :window_start
+                    AND deleted_at IS NULL
+                    AND public_ip IS NOT NULL
+                    AND public_ip != ''
+                    {hotkey_filter}
+            ),
+            ip_change_counts AS (
+                SELECT
+                    hotkey,
+                    worker_id,
+                    SUM(CASE WHEN prev_ip IS NOT NULL AND public_ip <> prev_ip THEN 1 ELSE 0 END) AS ip_changes
+                FROM non_null_ips
+                GROUP BY hotkey, worker_id
+            )
+            SELECT
+                a.hotkey,
+                a.worker_id,
+                COUNT(DISTINCT a.bucket) AS online_buckets,
+                COALESCE(ic.ip_changes, 0) AS ip_changes
+            FROM all_heartbeats a
+            LEFT JOIN ip_change_counts ic
+                ON a.hotkey = ic.hotkey AND a.worker_id = ic.worker_id
+            WHERE a.worker_id IS NOT NULL
+            GROUP BY a.hotkey, a.worker_id, ic.ip_changes
+        """
+        )
+        if needed_hotkeys:
+            sql = sql.bindparams(bindparam("hotkeys", expanding=True))
+        rows = session.execute(sql, params).fetchall()
+        for row in rows:
+            hotkey, worker_id, online_buckets, ip_changes = row
+            if not hotkey or not worker_id:
                 continue
-            if r.worker_id:
-                wkey = f"{r.hotkey}_{r.worker_id}"
-                if not limit_to_worker_keys or wkey in limit_to_worker_keys:
-                    by_worker.setdefault(wkey, []).append(r)
-
-            # Hotkey-level GPU presence per 5-min bucket for acceptance
-            if needed_hotkeys and r.hotkey not in needed_hotkeys:
+            wkey = f"{hotkey}_{worker_id}"
+            if limit_to_worker_keys and wkey not in limit_to_worker_keys:
                 continue
-            b = int(r.created_at.timestamp() // 300)
-            try:
-                present = self._extract_hb_gpu_uuids(r)
-            except Exception:
-                present = set()
-            if present:
-                by_hotkey_bucket_uuids.setdefault(r.hotkey, {}).setdefault(
-                    b, set()
-                ).update(present)
+            worker_stats[wkey] = (int(online_buckets), int(ip_changes))
 
-        # Build recent GPU participation set per worker for stricter availability
-        recent_gpu_by_worker: Dict[str, set] = {}
+        t_sql_elapsed = time.monotonic() - t_sql_start
+        bt.logging.debug(
+            f"Availability SQL | workers={len(worker_stats)} elapsed={t_sql_elapsed:.2f}s"
+        )
+
+        result: Dict[str, float] = {}
+
+        # GPU worker valid bucket counts - computed entirely in SQL
+        # Returns (hotkey, worker_id, valid_bucket_count) for GPU workers
+        t_gpu_start = time.monotonic()
+        gpu_worker_buckets: Dict[str, int] = {}  # wkey -> valid_bucket_count
+
         gpu_cutoff = datetime.utcnow() - timedelta(
             minutes=max(1, int(consistency_minutes))
         )
-        cg = (
-            session.query(ComputeChallenge)
-            .filter(ComputeChallenge.created_at >= gpu_cutoff)
-            .filter(ComputeChallenge.deleted_at.is_(None))
-            .filter(ComputeChallenge.verification_result.is_(True))
+        gpu_params: Dict[str, Any] = {
+            "window_start": window_start,
+            "gpu_cutoff": gpu_cutoff,
+        }
+        gpu_hotkey_filter = ""
+        if needed_hotkeys:
+            gpu_hotkey_filter = "AND hotkey IN :hotkeys"
+            gpu_params["hotkeys"] = tuple(needed_hotkeys)
+
+        if is_postgres:
+            # PostgreSQL: Use array containment operator for subset check
+            gpu_sql = text(
+                f"""
+                WITH
+                -- Step 1: Extract required GPU UUIDs per worker from recent challenges
+                worker_required_gpus AS (
+                    SELECT
+                        hotkey,
+                        worker_id,
+                        array_agg(DISTINCT gpu_uuid) AS required_uuids
+                    FROM (
+                        SELECT
+                            hotkey,
+                            worker_id,
+                            jsonb_object_keys(merkle_commitments::jsonb) AS gpu_uuid
+                        FROM compute_challenges
+                        WHERE created_at >= :gpu_cutoff
+                            AND deleted_at IS NULL
+                            AND verification_result = TRUE
+                            AND merkle_commitments IS NOT NULL
+                            {gpu_hotkey_filter}
+                    ) sub
+                    WHERE gpu_uuid IS NOT NULL AND gpu_uuid != '-1'
+                    GROUP BY hotkey, worker_id
+                ),
+                -- Step 2: GPU UUIDs present per (hotkey, bucket)
+                bucket_gpus AS (
+                    SELECT
+                        hotkey,
+                        CAST(EXTRACT(EPOCH FROM created_at) / 300 AS INTEGER) AS bucket,
+                        array_agg(DISTINCT gpu_uuid) AS present_uuids
+                    FROM (
+                        SELECT
+                            hotkey,
+                            created_at,
+                            COALESCE(
+                                elem->>'uuid',
+                                elem->>'gpu_uuid',
+                                elem->>'id'
+                            ) AS gpu_uuid
+                        FROM heartbeat_records
+                        CROSS JOIN LATERAL jsonb_array_elements(gpu_utilization::jsonb) AS elem
+                        WHERE created_at >= :window_start
+                            AND deleted_at IS NULL
+                            AND gpu_utilization IS NOT NULL
+                            AND jsonb_array_length(gpu_utilization::jsonb) > 0
+                            {gpu_hotkey_filter}
+                    ) sub
+                    WHERE gpu_uuid IS NOT NULL AND gpu_uuid != '-1' AND gpu_uuid != ''
+                    GROUP BY hotkey, bucket
+                )
+                -- Step 3: Count valid buckets per worker (where required ⊆ present)
+                SELECT
+                    w.hotkey,
+                    w.worker_id,
+                    COUNT(DISTINCT b.bucket) AS valid_bucket_count
+                FROM worker_required_gpus w
+                LEFT JOIN bucket_gpus b
+                    ON w.hotkey = b.hotkey
+                    AND w.required_uuids <@ b.present_uuids
+                GROUP BY w.hotkey, w.worker_id
+            """
+            )
+        else:
+            # SQLite: Use json_group_array and NOT EXISTS for robust subset check
+            gpu_sql = text(
+                f"""
+                WITH
+                -- Step 1: Extract required GPU UUIDs per worker from recent challenges
+                worker_required_gpus AS (
+                    SELECT
+                        hotkey,
+                        worker_id,
+                        json_group_array(gpu_uuid) AS required_uuids
+                    FROM (
+                        SELECT DISTINCT
+                            hotkey,
+                            worker_id,
+                            key AS gpu_uuid
+                        FROM compute_challenges, json_each(merkle_commitments)
+                        WHERE created_at >= :gpu_cutoff
+                            AND deleted_at IS NULL
+                            AND verification_result = 1
+                            AND merkle_commitments IS NOT NULL
+                            AND json_type(merkle_commitments) = 'object'
+                            AND key IS NOT NULL
+                            AND key != '-1'
+                            {gpu_hotkey_filter}
+                    )
+                    GROUP BY hotkey, worker_id
+                ),
+                -- Step 2: GPU UUIDs present per (hotkey, bucket)
+                bucket_gpus AS (
+                    SELECT
+                        hotkey,
+                        bucket,
+                        json_group_array(gpu_uuid) AS present_uuids
+                    FROM (
+                        SELECT DISTINCT
+                            hotkey,
+                            CAST(strftime('%s', created_at) / 300 AS INTEGER) AS bucket,
+                            COALESCE(
+                                json_extract(elem.value, '$.uuid'),
+                                json_extract(elem.value, '$.gpu_uuid'),
+                                json_extract(elem.value, '$.id')
+                            ) AS gpu_uuid
+                        FROM heartbeat_records
+                        JOIN json_each(gpu_utilization) AS elem
+                        WHERE created_at >= :window_start
+                            AND deleted_at IS NULL
+                            AND gpu_utilization IS NOT NULL
+                            AND json_type(gpu_utilization) = 'array'
+                            AND json_array_length(gpu_utilization) > 0
+                            {gpu_hotkey_filter}
+                    )
+                    WHERE gpu_uuid IS NOT NULL AND gpu_uuid != '' AND gpu_uuid != '-1'
+                    GROUP BY hotkey, bucket
+                ),
+                -- Step 3: Check subset using NOT EXISTS (all required must be in present)
+                worker_bucket_valid AS (
+                    SELECT
+                        w.hotkey,
+                        w.worker_id,
+                        b.bucket
+                    FROM worker_required_gpus w
+                    JOIN bucket_gpus b ON w.hotkey = b.hotkey
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM json_each(w.required_uuids) req
+                        WHERE req.value NOT IN (
+                            SELECT p.value FROM json_each(b.present_uuids) p
+                        )
+                    )
+                )
+                -- Step 4: Count valid buckets per worker
+                SELECT
+                    hotkey,
+                    worker_id,
+                    COUNT(DISTINCT bucket) AS valid_bucket_count
+                FROM worker_bucket_valid
+                GROUP BY hotkey, worker_id
+            """
+            )
+
+        if needed_hotkeys:
+            gpu_sql = gpu_sql.bindparams(bindparam("hotkeys", expanding=True))
+
+        gpu_rows = session.execute(gpu_sql, gpu_params).fetchall()
+        t_gpu_query = time.monotonic() - t_gpu_start
+        bt.logging.debug(
+            f"GPU worker bucket query | rows={len(gpu_rows)} elapsed={t_gpu_query:.2f}s"
         )
-        for ch in cg.all():
-            if not ch.worker_id or not ch.hotkey:
+
+        for hotkey, worker_id, valid_bucket_count in gpu_rows:
+            if not hotkey or not worker_id:
                 continue
-            wkey = f"{ch.hotkey}_{ch.worker_id}"
-            if limit_to_worker_keys and wkey not in limit_to_worker_keys:
-                continue
-            try:
-                mc = ch.merkle_commitments or {}
-                uuids = {
-                    u
-                    for u in (mc.keys() if isinstance(mc, dict) else [])
-                    if u and u != "-1"
-                }
-            except Exception:
-                uuids = set()
-            if uuids:
-                recent_gpu_by_worker.setdefault(wkey, set()).update(uuids)
+            wkey = f"{hotkey}_{worker_id}"
+            gpu_worker_buckets[wkey] = int(valid_bucket_count or 0)
 
-        expected_intervals = max(1, int(hours * 12))  # 5-min buckets
-        result: Dict[str, float] = {}
+        # Process each worker
+        all_worker_keys = set(worker_stats.keys())
+        if limit_to_worker_keys:
+            all_worker_keys = all_worker_keys & limit_to_worker_keys
 
-        for key, recs in by_worker.items():
-            # Stable IP-change detection sort
-            recs.sort(key=lambda r: (r.created_at, r.id))
+        for wkey in all_worker_keys:
+            _, ip_changes = worker_stats.get(wkey, (0, 0))
 
-            # Per-worker grouping for IP penalty source
-            required = recent_gpu_by_worker.get(key, set())
-            intervals: set = set()
-
-            hotkey = key.split("_", 1)[0]
-            hb_uuids_by_bucket = by_hotkey_bucket_uuids.get(hotkey, {})
-            if not required:
-                # CPU/no-GPU: count bucket only if this worker_id has a heartbeat
-                intervals = {int(r.created_at.timestamp() // 300) for r in recs}
+            if wkey in gpu_worker_buckets:
+                # GPU worker: use SQL-computed valid bucket count
+                valid_buckets = gpu_worker_buckets[wkey]
+                online_ratio = min(1.0, valid_buckets / expected_intervals)
             else:
-                for b, present in hb_uuids_by_bucket.items():
-                    try:
-                        if required.issubset(present):
-                            intervals.add(b)
-                    except Exception:
-                        continue
-            online_ratio = min(1.0, len(intervals) / expected_intervals)
+                # CPU/no-GPU worker: use heartbeat bucket count from first SQL
+                online_buckets, _ = worker_stats.get(wkey, (0, 0))
+                online_ratio = min(1.0, online_buckets / expected_intervals)
 
-            # Per-worker IP change penalty
-            ip_changes_for_this_worker = 0
-            last_ip: Optional[str] = None
-            for r in recs:
-                ip = getattr(r, "public_ip", None)
-                if not ip:
-                    continue
-                if last_ip is None:
-                    last_ip = ip
-                elif ip != last_ip:
-                    ip_changes_for_this_worker += 1
-                    last_ip = ip
-
-            if ip_changes_for_this_worker > 0:
-                penalty = 0.5**ip_changes_for_this_worker
+            # Apply IP penalty
+            if ip_changes > 0:
+                penalty = 0.5**ip_changes
                 if penalty < 0.1:
                     penalty = 0.0
                 online_ratio *= penalty
 
             computed_availability = max(0.0, min(1.0, float(online_ratio)))
-            result[key] = computed_availability
+            result[wkey] = computed_availability
 
-            # Update cache for this worker
-            cache_key = f"{key}_{cache_key_params}"
+            cache_key = f"{wkey}_{cache_key_params}"
             self._availability_cache[cache_key] = (computed_availability, now)
 
         # Workers with no heartbeats → availability 0 if present in limit
@@ -498,7 +697,6 @@ class WorkerPerformanceRanker:
             for k in limit_to_worker_keys:
                 if k not in result:
                     result[k] = 0.0
-                    # Cache the zero availability too
                     cache_key = f"{k}_{cache_key_params}"
                     self._availability_cache[cache_key] = (0.0, now)
 
@@ -532,24 +730,6 @@ class WorkerPerformanceRanker:
                 self._availability_cache.clear()
 
         return final_result
-
-    def _extract_hb_gpu_uuids(self, hb: Any) -> set:
-        try:
-            data = getattr(hb, "gpu_utilization", None)
-            if not data:
-                return set()
-            if isinstance(data, list):
-                uuids = set()
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    u = item.get("uuid") or item.get("gpu_uuid") or item.get("id")
-                    if isinstance(u, str) and u and u != "-1":
-                        uuids.add(u)
-                return uuids
-        except Exception:
-            return set()
-        return set()
 
     def calculate_miner_challenge_scores(
         self, ranked_workers: Dict[str, WorkerPerformanceScore]

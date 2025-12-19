@@ -15,17 +15,19 @@ from typing import List, Optional
 import bittensor as bt
 
 from neurons.shared.config.config_manager import ConfigManager
+from neurons.validator.services.subtensor_access import SubtensorAccessGuard
 
 
 class MetagraphCache:
     def __init__(
         self,
-        subtensor: bt.subtensor,
+        subtensor_guard: SubtensorAccessGuard,
         netuid: int,
         metagraph: bt.metagraph,
         config: ConfigManager,
     ) -> None:
-        self.subtensor = subtensor
+        self._subtensor_guard = subtensor_guard
+        self.subtensor = subtensor_guard.subtensor
         self.netuid = int(netuid)
         self._metagraph = metagraph  # shared instance; we only sync here
         self.config = config
@@ -101,10 +103,10 @@ class MetagraphCache:
                 bt.logging.warning(f"⚠️ Metagraph cache sync error | error={e}")
 
     async def _sync_once(self) -> None:
-        loop = asyncio.get_event_loop()
+        sync_start = time.monotonic()
         # Reuse same metagraph instance, but sync it here only
-        await loop.run_in_executor(
-            None, lambda: self._metagraph.sync(subtensor=self.subtensor)
+        await self._subtensor_guard.run(
+            lambda: self._metagraph.sync(subtensor=self.subtensor)
         )
         # Take a snapshot of hotkeys after sync
         hk = getattr(self._metagraph, "hotkeys", None)
@@ -117,6 +119,7 @@ class MetagraphCache:
             self._ready_event.set()
 
         self._last_sync_ts = time.time()
+        elapsed = time.monotonic() - sync_start
         bt.logging.debug(
-            f"Metagraph cache refreshed | miners={len(self._hotkeys)} interval={self._sync_interval}s"
+            f"Metagraph cache refreshed | miners={len(self._hotkeys)} elapsed={elapsed:.2f}s"
         )

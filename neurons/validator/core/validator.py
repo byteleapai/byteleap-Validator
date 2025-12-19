@@ -10,7 +10,8 @@ import bittensor as bt
 from neurons.shared.crypto import CryptoManager
 from neurons.shared.protocols import ChallengeProofSynapse, ChallengeSynapse
 from neurons.shared.protocols import EncryptedSynapse as BaseSynapse
-from neurons.shared.protocols import (HeartbeatSynapse, SessionInitSynapse,
+from neurons.shared.protocols import (GetVmgwEnrollTokenSynapse,
+                                      HeartbeatSynapse, SessionInitSynapse,
                                       TaskSynapse)
 from neurons.validator.challenge_status import ChallengeStatus
 from neurons.validator.models.database import (DatabaseManager, MinerInfo,
@@ -22,6 +23,7 @@ from neurons.validator.services.meshhub_client import MeshHubClient
 from neurons.validator.services.metagraph_cache import MetagraphCache
 from neurons.validator.services.processor_factory import \
     ValidatorProcessorFactory
+from neurons.validator.services.subtensor_access import SubtensorAccessGuard
 from neurons.validator.services.validation import MinerValidationService
 from neurons.validator.services.weight_manager import WeightManager
 
@@ -55,8 +57,8 @@ class Validator:
 
         # Initialize wallet using provided bt_config (single source of truth)
         self.wallet = bt.wallet(config=bt_config)
-        bt.logging.info(f"👛 Wallet | name={self.wallet.name}")
-        bt.logging.info(f"🔑 Hotkey | name={self.wallet.hotkey_str}")
+        bt.logging.info(f"🚀 Wallet | name={self.wallet.name}")
+        bt.logging.info(f"🔐 Hotkey | name={self.wallet.hotkey_str}")
 
         # Network configuration
         self.netuid = self.config.get_positive_number("netuid", int)
@@ -71,10 +73,12 @@ class Validator:
             )
             raise
 
+        self.subtensor_guard = SubtensorAccessGuard(self.subtensor)
+
         # Initialize metagraph and cache service
         self.metagraph = bt.metagraph(netuid=self.netuid, subtensor=self.subtensor)
         self.metagraph_cache = MetagraphCache(
-            self.subtensor, self.netuid, self.metagraph, config
+            self.subtensor_guard, self.netuid, self.metagraph, config
         )
 
         # Database manager
@@ -107,7 +111,7 @@ class Validator:
         self.weight_manager = WeightManager(
             self.database_manager,
             self.wallet,
-            self.subtensor,
+            self.subtensor_guard,
             self.metagraph,
             config,
             meshhub_client=self.meshhub_client,
@@ -222,7 +226,7 @@ class Validator:
 
                     session.commit()
                     bt.logging.info(
-                        f"🔄 Restart cleanup | failed={len(interrupted_challenges)} interrupted challenges"
+                        f"🚀 Restart cleanup | failed={len(interrupted_challenges)} interrupted challenges"
                     )
 
         except Exception as e:
@@ -232,6 +236,7 @@ class Validator:
         """Register synapse processors for communication"""
         from neurons.shared.protocols import (ChallengeProofSynapse,
                                               ChallengeSynapse,
+                                              GetVmgwEnrollTokenSynapse,
                                               HeartbeatSynapse, TaskSynapse)
         from neurons.validator.processors.commitment_processor import \
             CommitmentProcessor
@@ -250,6 +255,13 @@ class Validator:
             self._process_task_request
         )
         self.communicator.register_processor(TaskSynapse, task_processor)
+
+        enroll_token_processor = processor_factory.create_vmgw_enroll_token_processor(
+            self._process_enroll_token_request
+        )
+        self.communicator.register_processor(
+            GetVmgwEnrollTokenSynapse, enroll_token_processor
+        )
 
         # Two-phase challenge verification processors with verification config
         commitment_processor = CommitmentProcessor(
@@ -278,56 +290,9 @@ class Validator:
             # HeartbeatData is a Pydantic model; enforce model-based parsing
             heartbeat_dict = request_data.model_dump()
 
-            workers_processed = 0
-
-            with self.database_manager.get_session() as session:
-                # Update miner heartbeat
-                self.database_manager.update_miner_heartbeat(
-                    session, peer_hotkey, heartbeat_dict
-                )
-
-                # Process individual workers
-                for worker_info in heartbeat_dict.get("workers", []):
-                    worker_id = worker_info.get("worker_id")
-                    if worker_id:
-                        worker_data = worker_info
-                        self.database_manager.update_worker_heartbeat(
-                            session,
-                            worker_id,
-                            peer_hotkey,
-                            worker_data,
-                            heartbeat_interval_minutes=1,  # 60 second intervals
-                        )
-
-                        # Update worker hardware info if system_info is available
-                        system_info = worker_data.get("system_info")
-                        if system_info and isinstance(system_info, dict):
-                            self.database_manager.update_worker_hardware_info(
-                                session, peer_hotkey, worker_id, system_info
-                            )
-
-                            # Update GPU inventory if GPU plugin details are present
-                            gpu_plugin_details = system_info.get("gpu_plugin", [])
-
-                            if gpu_plugin_details:
-                                for gpu_detail in gpu_plugin_details:
-                                    gpu_uuid = gpu_detail.get("uuid")
-                                    if gpu_uuid:
-                                        try:
-                                            # Pass complete GPU details to database
-                                            self.database_manager.upsert_gpu_inventory(
-                                                session=session,
-                                                gpu_uuid=gpu_uuid,
-                                                hotkey=peer_hotkey,
-                                                worker_id=worker_id,
-                                                gpu_details=gpu_detail,
-                                            )
-                                        except Exception as e:
-                                            bt.logging.warning(
-                                                f"Failed to update GPU inventory for {gpu_uuid}: {e}"
-                                            )
-
-                        workers_processed += 1
+            workers_processed = await asyncio.to_thread(
+                self._process_heartbeat_sync, heartbeat_dict, peer_hotkey
+            )
 
             response = HeartbeatResponse(
                 error_code=ErrorCodes.SUCCESS,
@@ -351,74 +316,203 @@ class Validator:
             )
             return response.model_dump(), ErrorCodes.HEARTBEAT_PROCESSING_FAILED
 
+    def _process_heartbeat_sync(
+        self, heartbeat_dict: Dict[str, Any], peer_hotkey: str
+    ) -> int:
+        """Synchronous heartbeat processing executed in worker thread."""
+        workers_processed = 0
+
+        with self.database_manager.get_session() as session:
+            # Update miner heartbeat
+            self.database_manager.update_miner_heartbeat(
+                session, peer_hotkey, heartbeat_dict
+            )
+
+            # Process individual workers
+            for worker_info in heartbeat_dict.get("workers", []):
+                worker_id = worker_info.get("worker_id")
+                if not worker_id:
+                    continue
+
+                worker_data = worker_info
+                self.database_manager.update_worker_heartbeat(
+                    session,
+                    worker_id,
+                    peer_hotkey,
+                    worker_data,
+                    heartbeat_interval_minutes=1,  # 60 second intervals
+                )
+
+                # Update worker hardware info if system_info is available
+                system_info = worker_data.get("system_info")
+                if system_info and isinstance(system_info, dict):
+                    self.database_manager.update_worker_hardware_info(
+                        session, peer_hotkey, worker_id, system_info
+                    )
+
+                    # Update GPU inventory if GPU plugin details are present
+                    gpu_plugin_details = system_info.get("gpu_plugin", [])
+
+                    if gpu_plugin_details:
+                        for gpu_detail in gpu_plugin_details:
+                            gpu_uuid = gpu_detail.get("uuid")
+                            if gpu_uuid:
+                                try:
+                                    # Pass complete GPU details to database
+                                    self.database_manager.upsert_gpu_inventory(
+                                        session=session,
+                                        gpu_uuid=gpu_uuid,
+                                        hotkey=peer_hotkey,
+                                        worker_id=worker_id,
+                                        gpu_details=gpu_detail,
+                                    )
+                                except Exception as e:
+                                    bt.logging.warning(
+                                        f"Failed to update GPU inventory for {gpu_uuid}: {e}"
+                                    )
+
+                workers_processed += 1
+
+        return workers_processed
+
     async def _process_task_request(self, request_data, peer_hotkey):
         """Process decrypted task request data"""
         from neurons.shared.protocols import TaskResponse
 
         try:
-            # Check if there are any pending challenges for this miner
-            with self.database_manager.get_session() as session:
-                from datetime import datetime, timedelta
+            timeout_secs = self.config.get_positive_number(
+                "validation.challenge_timeout", int
+            )
 
-                from neurons.validator.challenge_status import ChallengeStatus
-                from neurons.validator.models.database import ComputeChallenge
+            response_payload = await asyncio.to_thread(
+                self._build_task_response_sync, peer_hotkey, timeout_secs
+            )
 
-                # Find all pending challenges for this miner using status field
-                now = datetime.utcnow()
-                pending_challenges = (
-                    session.query(ComputeChallenge)
-                    .filter(
-                        ComputeChallenge.hotkey == peer_hotkey,
-                        ComputeChallenge.challenge_status == ChallengeStatus.CREATED,
-                        ComputeChallenge.deleted_at.is_(None),  # Not deleted
-                    )
-                    .all()
-                )
-
-                if pending_challenges:
-                    timeout_secs = self.config.get_positive_number(
-                        "validation.challenge_timeout", int
-                    )
-
-                    # Prepare challenge data for batch processing
-                    challenges_data = []
-                    for challenge in pending_challenges:
-                        challenge_data = {
-                            "challenge_id": challenge.challenge_id,
-                            "challenge_type": challenge.challenge_type,
-                            "data": challenge.challenge_data,
-                            "timeout": timeout_secs,
-                            "target_worker_id": challenge.worker_id,
-                        }
-                        challenges_data.append(challenge_data)
-
-                        # Mark challenge as sent and update expiration time with same timestamp
-                        challenge.sent_at = now
-                        challenge.challenge_status = ChallengeStatus.SENT
-                        challenge.expires_at = now + timedelta(seconds=timeout_secs)
-
-                    session.commit()
-
-                    # Always use batch response for consistency
-                    response = TaskResponse(
-                        task_type="compute_challenge_batch",
-                        task_data={"challenges": challenges_data},
-                    )
-                    bt.logging.debug(
-                        f"Sent {len(pending_challenges)} challenges in batch to {peer_hotkey}"
-                    )
-                else:
-                    # No tasks available
-                    response = TaskResponse(task_type="no_task", task_data=None)
-                    bt.logging.debug(f"No tasks available for {peer_hotkey}")
-
-            return response.model_dump(), 0
+            return response_payload, 0
 
         except Exception as e:
             bt.logging.error(
                 f"❌ Task request processing failed for {peer_hotkey}: {e}"
             )
             return None, 1
+
+    def _build_task_response_sync(
+        self, peer_hotkey: str, timeout_secs: int
+    ) -> Dict[str, Any]:
+        """Synchronous task preparation executed in worker thread."""
+        from datetime import datetime, timedelta
+
+        from neurons.shared.protocols import TaskResponse
+        from neurons.validator.challenge_status import ChallengeStatus
+        from neurons.validator.models.database import ComputeChallenge
+
+        with self.database_manager.get_session() as session:
+            now = datetime.utcnow()
+            pending_challenges = (
+                session.query(ComputeChallenge)
+                .filter(
+                    ComputeChallenge.hotkey == peer_hotkey,
+                    ComputeChallenge.challenge_status == ChallengeStatus.CREATED,
+                    ComputeChallenge.deleted_at.is_(None),
+                )
+                .all()
+            )
+
+            if pending_challenges:
+                challenges_data = []
+                for challenge in pending_challenges:
+                    challenge_data = {
+                        "challenge_id": challenge.challenge_id,
+                        "challenge_type": challenge.challenge_type,
+                        "data": challenge.challenge_data,
+                        "timeout": timeout_secs,
+                        "target_worker_id": challenge.worker_id,
+                    }
+                    challenges_data.append(challenge_data)
+
+                    # Mark challenge as sent and update expiration time with same timestamp
+                    challenge.sent_at = now
+                    challenge.challenge_status = ChallengeStatus.SENT
+                    challenge.expires_at = now + timedelta(seconds=timeout_secs)
+
+                session.commit()
+
+                response = TaskResponse(
+                    task_type="compute_challenge_batch",
+                    task_data={"challenges": challenges_data},
+                )
+                bt.logging.debug(
+                    f"Sent {len(pending_challenges)} challenges in batch to {peer_hotkey}"
+                )
+            else:
+                response = TaskResponse(task_type="no_task", task_data=None)
+                bt.logging.debug(f"No tasks available for {peer_hotkey}")
+
+            return response.model_dump()
+
+    async def _process_enroll_token_request(
+        self, request_data, peer_hotkey: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Handle miner requests for VM gateway enroll tokens."""
+        from neurons.shared.protocols import ErrorCodes
+
+        worker_id = getattr(request_data, "worker_id", "")
+        bt.logging.debug(
+            f"VMGW enroll token request received | peer={peer_hotkey} worker_id={worker_id}"
+        )
+
+        try:
+            state, token_data = await self.meshhub_client.acquire_enroll_token(
+                peer_hotkey
+            )
+        except Exception as e:
+            bt.logging.error(
+                f"❌ VMGW enroll token handling failed | peer={peer_hotkey} | error={e}"
+            )
+            payload = {
+                "code": ErrorCodes.NETWORK_ERROR,
+                "error_message": "meshhub_unavailable",
+            }
+            return payload, ErrorCodes.NETWORK_ERROR
+
+        bt.logging.debug(f"VMGW enroll token state | peer={peer_hotkey} state={state}")
+
+        if state == "ready" and token_data:
+            payload = {
+                "code": ErrorCodes.SUCCESS,
+                "token": token_data.get("token"),
+                "expires_at": token_data.get("expires_at"),
+                "enrollment_url": token_data.get("enrollment_url"),
+            }
+            return payload, ErrorCodes.SUCCESS
+
+        if state == "pending":
+            payload = {
+                "code": ErrorCodes.SUCCESS,
+                "token": None,
+                "try_again_in_sec": MeshHubClient.ENROLL_TOKEN_RETRY_SECONDS,
+            }
+            return payload, ErrorCodes.SUCCESS
+
+        if state == "blocked":
+            payload = {
+                "code": ErrorCodes.INVALID_REQUEST,
+                "error_message": "token_request_failed",
+            }
+            return payload, ErrorCodes.INVALID_REQUEST
+
+        if state == "unavailable":
+            payload = {
+                "code": ErrorCodes.NETWORK_ERROR,
+                "error_message": "meshhub_unavailable",
+            }
+            return payload, ErrorCodes.NETWORK_ERROR
+
+        payload = {
+            "code": ErrorCodes.INVALID_RESPONSE,
+            "error_message": "unexpected_token_state",
+        }
+        return payload, ErrorCodes.INVALID_RESPONSE
 
     async def _check_expired_data_on_startup(self) -> None:
         """
@@ -477,6 +571,10 @@ class Validator:
             blacklist_fn=self._blacklist_challenge_proof,
         )
         self.axon.attach(
+            forward_fn=self._handle_get_enroll_token,
+            blacklist_fn=self._blacklist_get_enroll_token,
+        )
+        self.axon.attach(
             forward_fn=self._handle_session_init,
             blacklist_fn=self._blacklist_session_init,
         )
@@ -518,6 +616,11 @@ class Validator:
     ) -> Tuple[bool, str]:
         return self._is_authorized_hotkey(synapse)
 
+    def _blacklist_get_enroll_token(
+        self, synapse: GetVmgwEnrollTokenSynapse
+    ) -> Tuple[bool, str]:
+        return self._is_authorized_hotkey(synapse)
+
     def _blacklist_session_init(self, synapse: SessionInitSynapse) -> Tuple[bool, str]:
         # Block session handshakes from non‑metagraph hotkeys
         return self._is_authorized_hotkey(synapse)
@@ -538,6 +641,11 @@ class Validator:
     ) -> ChallengeProofSynapse:
         return await self.communicator.handle_synapse(synapse)
 
+    async def _handle_get_enroll_token(
+        self, synapse: GetVmgwEnrollTokenSynapse
+    ) -> GetVmgwEnrollTokenSynapse:
+        return await self.communicator.handle_synapse(synapse)
+
     async def _handle_session_init(
         self, synapse: SessionInitSynapse
     ) -> SessionInitSynapse:
@@ -552,7 +660,7 @@ class Validator:
                     self.communicator.session_manager.cleanup_expired_sessions()
                 )
                 if expired_count > 0:
-                    bt.logging.info(f"🧹 Session cleanup | expired={expired_count}")
+                    bt.logging.info(f"✅ Session cleanup | expired={expired_count}")
 
                 await asyncio.sleep(CryptoManager.SESSION_CLEANUP_INTERVAL_SECONDS)
 
@@ -587,11 +695,11 @@ class Validator:
             await self.data_cleanup_service.start()
 
             self.axon.serve(netuid=self.netuid, subtensor=self.subtensor)
-            bt.logging.info(f"🛰️ Axon served | netuid={self.netuid}")
+            bt.logging.info(f"✅ Axon served | netuid={self.netuid}")
 
             self.axon.start()
             bt.logging.info(
-                f"🛰️ Axon online | addr={self.axon.ip}:{self.axon.port} started={self.axon.started}"
+                f"✅ Axon online | addr={self.axon.ip}:{self.axon.port} started={self.axon.started}"
             )
 
             await self.validation_service.start()
@@ -615,7 +723,7 @@ class Validator:
         """Stop validator and cleanup resources"""
         if not self.is_running:
             return
-        bt.logging.info("⏹️ Stopping validator...")
+        bt.logging.info("Stopping validator...")
         await self._graceful_shutdown()
 
     async def _graceful_shutdown(self) -> None:
@@ -658,7 +766,7 @@ class Validator:
 
                 raise RuntimeError(self._fatal_reason)
         except KeyboardInterrupt:
-            bt.logging.info("⏹️ Validator interrupt | stopping")
+            bt.logging.info("Validator interrupt | stopping")
         except Exception as e:
             bt.logging.error(f"❌ Validator run error | error={e}")
         finally:

@@ -44,6 +44,7 @@ class ProtocolTypes:
     CHALLENGE = "CHALLENGE_V1"
     CHALLENGE_PROOF = "CHALLENGE_PROOF_V1"
     SESSION_INIT = "SESSION_INIT_V1"
+    GET_VMGW_ENROLL_TOKEN = "GET_VMGW_ENROLL_TOKEN_V1"
 
 
 # Error codes
@@ -255,20 +256,37 @@ class TaskSynapse(EncryptedSynapse):
     PROTOCOL_TYPE: ClassVar[str] = ProtocolTypes.TASK
 
 
+class GetVmgwEnrollTokenRequest(StrictModel):
+    """Request payload for VM gateway enroll token retrieval."""
+
+    worker_id: str = Field(description="Worker ID requesting VM gateway enroll token")
+
+    @model_validator(mode="after")
+    def validate_worker_id(self) -> "GetVmgwEnrollTokenRequest":
+        if not self.worker_id or not self.worker_id.strip():
+            raise ValueError("worker_id cannot be empty")
+        return self
+
+
+class GetVmgwEnrollTokenSynapse(EncryptedSynapse):
+    """Synapse for retrieving VM gateway enroll tokens."""
+
+    PROTOCOL_TYPE: ClassVar[str] = ProtocolTypes.GET_VMGW_ENROLL_TOKEN
+
+
 def _is_hex(s: str) -> bool:
     try:
         int(s, 16)
         return True
-    except Exception:
+    except (ValueError, TypeError):
         return False
 
 
 def _is_base64(s: str) -> bool:
     try:
-        # validate without padding issues
         base64.b64decode(s, validate=True)
         return True
-    except Exception:
+    except (ValueError, TypeError, binascii.Error):
         return False
 
 
@@ -531,6 +549,7 @@ ProtocolRegistry.register(HeartbeatSynapse)
 ProtocolRegistry.register(TaskSynapse)
 ProtocolRegistry.register(ChallengeSynapse)
 ProtocolRegistry.register(ChallengeProofSynapse)
+ProtocolRegistry.register(GetVmgwEnrollTokenSynapse)
 ProtocolRegistry.register(SessionInitSynapse)
 
 __all__ = [
@@ -555,6 +574,8 @@ __all__ = [
     "EncryptedSynapse",
     "HeartbeatSynapse",
     "TaskSynapse",
+    "GetVmgwEnrollTokenRequest",
+    "GetVmgwEnrollTokenSynapse",
     "ChallengeSynapse",
     "ChallengeProofSynapse",
     "SessionInitSynapse",

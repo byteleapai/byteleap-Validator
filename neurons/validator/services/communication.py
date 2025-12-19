@@ -72,8 +72,9 @@ from neurons.shared.communication_logging import (CommunicationLogger,
                                                   NetworkRecorder)
 from neurons.shared.crypto import CryptoManager
 from neurons.shared.protocols import (CommunicationResult, EncryptedSynapse,
-                                      ErrorCodes, SessionInitRequest,
-                                      SessionInitResponse, SessionInitSynapse)
+                                      ErrorCodes, ProtocolTypes,
+                                      SessionInitRequest, SessionInitResponse,
+                                      SessionInitSynapse)
 from neurons.shared.synapse import SynapseHandler
 from neurons.validator.services.processor_factory import \
     ValidatorProcessorFactory
@@ -104,7 +105,7 @@ class ValidatorCommunicationService:
         # Logging components
         self.logger = CommunicationLogger("validator")
         # Only record network logs to DB when log level is DEBUG to avoid growth
-        lvl = self.config.get("logging.log_level")
+        lvl = self.config.get_non_empty_string("logging.log_level")
         record_enabled = str(lvl).upper() == "DEBUG"
         self.recorder = NetworkRecorder(
             database_manager, self.logger, record_enabled=record_enabled
@@ -134,7 +135,7 @@ class ValidatorCommunicationService:
         # Simple counters
         self._rl_blocked_total: int = 0
 
-        bt.logging.info("🛰️ Validator communication service initialized")
+        bt.logging.info("🚀 Validator communication service initialized")
         bt.logging.info(
             f"🧱 RL config | window={self._rl_window_seconds}s max={self._rl_max_requests} max_peers={self.RL_MAX_PEERS}"
         )
@@ -495,12 +496,20 @@ class ValidatorCommunicationService:
 
             # Record processing result to database
             if network_log_id > 0:
+                response_for_record = response_data if result.success else None
+                if (
+                    response_for_record
+                    and synapse_type_name == ProtocolTypes.GET_VMGW_ENROLL_TOKEN
+                    and isinstance(response_for_record, dict)
+                ):
+                    response_for_record = dict(response_for_record)
+                    response_for_record.pop("token", None)
                 with self.database_manager.get_session() as session:
                     self.recorder.record_processing_result(
                         session,
                         network_log_id,
                         result,
-                        response_data if result.success else None,
+                        response_for_record,
                         processing_time_ms=processing_time_ms,
                     )
 

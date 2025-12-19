@@ -5,12 +5,30 @@ Handles background verification of committed challenges using batch processing
 
 import asyncio
 import concurrent.futures
+import hashlib
 import math
 import multiprocessing as mp
+import os
+import secrets
 import signal
+import struct
+import threading
+import time
 from collections import OrderedDict
+from concurrent.futures.process import BrokenProcessPool
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
+import bittensor as bt
 import numpy as np
+from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
+
+from neurons.shared.challenges.cpu_matrix_challenge import CPUMatrixChallenge
+from neurons.shared.config.config_manager import ConfigManager
+from neurons.shared.utils.merkle_tree import verify_row_proofs
+from neurons.validator.challenge_status import ChallengeStatus
+from neurons.validator.models.database import ComputeChallenge, DatabaseManager
+from neurons.validator.services.proof_cache import LRUProofCache
 
 
 def _verify_coords_worker(
@@ -104,22 +122,15 @@ def _pool_worker_initializer() -> None:
 
 
 def _transform_gpu_seed_worker(gpu_seed_str: str) -> int:
-    import hashlib
-
     seed_hash = hashlib.sha256(gpu_seed_str.encode()).digest()
     transformed_seed = int.from_bytes(seed_hash[:8], byteorder="little")
     return transformed_seed
-
-
-from typing import Any, Dict, List, Tuple
 
 
 def _compute_row_hash_from_segment_worker(
     values: List[float], start: int, length: int
 ) -> str:
     # GPU worker row hashing compatibility with CUDA FNV-1a on FP16
-    import struct
-
     hash_val = 0xCBF29CE484222325
     fnv_prime = 0x100000001B3
 
@@ -157,48 +168,80 @@ def _lru_set(
     return val
 
 
-def _get_a_row_vector_cached(seed_hash: int, matrix_size: int, row: int) -> np.ndarray:
-    key = (int(seed_hash), int(matrix_size), int(row))
-    cached = _lru_get(_A_ROW_CACHE, key)
+def _generate_matrix_vector_unified(
+    seed_hash: int,
+    matrix_size: int,
+    index: int,
+    cache: OrderedDict,
+    max_cache_size: int,
+    is_row_type: bool,
+) -> np.ndarray:
+    """
+    Unified matrix vector generation with caching.
+
+    Generates either A-matrix rows or B-matrix columns using identical hashing logic
+    but different XOR patterns.
+
+    Args:
+        seed_hash: Seed for matrix generation
+        matrix_size: Size of the matrix
+        index: Row or column index
+        cache: LRU cache to use
+        max_cache_size: Maximum cache size
+        is_row_type: True for A-matrix rows, False for B-matrix columns
+
+    Returns:
+        np.ndarray: Generated vector
+    """
+    key = (int(seed_hash), int(matrix_size), int(index))
+    cached = _lru_get(cache, key)
     if cached is not None:
         return cached
-    # Generate A(row, k) for k in [0..N)
+
     N = int(matrix_size)
     k = np.arange(N, dtype=np.uint64)
-    el = (
-        np.uint64(seed_hash)
-        ^ (np.uint64(row) << np.uint64(32))
-        ^ (k << np.uint64(16))
-        ^ np.uint64(0)
-    ) & np.uint64(0xFFFFFFFFFFFFFFFF)
+
+    # XOR pattern differs based on matrix type
+    if is_row_type:
+        # A(row, k) pattern: row in high bits, k in mid bits, flag=0
+        el = (
+            np.uint64(seed_hash)
+            ^ (np.uint64(index) << np.uint64(32))
+            ^ (k << np.uint64(16))
+            ^ np.uint64(0)
+        )
+    else:
+        # B(k, col) pattern: k in high bits, col in mid bits, flag=1
+        el = (
+            np.uint64(seed_hash)
+            ^ (k << np.uint64(32))
+            ^ (np.uint64(index) << np.uint64(16))
+            ^ np.uint64(1)
+        )
+
+    # Identical hashing logic for both types
+    el = el & np.uint64(0xFFFFFFFFFFFFFFFF)
     h = (el ^ (el >> np.uint64(32))) & np.uint64(0xFFFFFFFF)
     h = (h * np.uint64(0x9E3779B9) + np.uint64(0x85EBCA6B)) & np.uint64(0xFFFFFFFF)
     h = h ^ (h >> np.uint64(16))
     h = (h * np.uint64(0x85EBCA6B)) & np.uint64(0xFFFFFFFF)
     arr = (h & np.uint64(0xFFFF)).astype(np.float64) / 32768.0 - 1.0
-    return _lru_set(_A_ROW_CACHE, key, arr, _MAX_A_CACHE)
+
+    return _lru_set(cache, key, arr, max_cache_size)
+
+
+def _get_a_row_vector_cached(seed_hash: int, matrix_size: int, row: int) -> np.ndarray:
+    """Generate A-matrix row vector with caching."""
+    return _generate_matrix_vector_unified(
+        seed_hash, matrix_size, row, _A_ROW_CACHE, _MAX_A_CACHE, is_row_type=True
+    )
 
 
 def _get_b_col_vector_cached(seed_hash: int, matrix_size: int, col: int) -> np.ndarray:
-    key = (int(seed_hash), int(matrix_size), int(col))
-    cached = _lru_get(_B_COL_CACHE, key)
-    if cached is not None:
-        return cached
-    # Generate B(k, col) for k in [0..N)
-    N = int(matrix_size)
-    k = np.arange(N, dtype=np.uint64)
-    el = (
-        np.uint64(seed_hash)
-        ^ (k << np.uint64(32))
-        ^ (np.uint64(col) << np.uint64(16))
-        ^ np.uint64(1)
-    ) & np.uint64(0xFFFFFFFFFFFFFFFF)
-    h = (el ^ (el >> np.uint64(32))) & np.uint64(0xFFFFFFFF)
-    h = (h * np.uint64(0x9E3779B9) + np.uint64(0x85EBCA6B)) & np.uint64(0xFFFFFFFF)
-    h = h ^ (h >> np.uint64(16))
-    h = (h * np.uint64(0x85EBCA6B)) & np.uint64(0xFFFFFFFF)
-    arr = (h & np.uint64(0xFFFF)).astype(np.float64) / 32768.0 - 1.0
-    return _lru_set(_B_COL_CACHE, key, arr, _MAX_B_CACHE)
+    """Generate B-matrix column vector with caching."""
+    return _generate_matrix_vector_unified(
+        seed_hash, matrix_size, col, _B_COL_CACHE, _MAX_B_CACHE, is_row_type=False
+    )
 
 
 def _get_b_cols_matrix_cached(
@@ -215,28 +258,28 @@ def _get_b_cols_matrix_cached(
 def _compute_cpu_matrix_rows_worker(
     seed_hex: str, matrix_size: int, row_indices: List[int], iterations: int = 1
 ) -> List[str]:
-    import hashlib
-
-    import numpy as np
-
-    from neurons.shared.challenges.cpu_matrix_challenge import \
-        CPUMatrixChallenge
-
     seed = bytes.fromhex(seed_hex)
     matrix_a, matrix_b = CPUMatrixChallenge._generate_matrices_from_seed(
         seed, matrix_size
     )
 
-    if iterations > 1:
-        result = np.dot(matrix_a.astype(np.int64), matrix_b.astype(np.int64))
-        for _ in range(iterations - 1):
-            result = np.dot(result, matrix_b.astype(np.int64))
-    else:
-        result = np.dot(matrix_a.astype(np.int64), matrix_b.astype(np.int64))
+    # reducing complexity from O(N^3) to O(k * N^2).
+    if not row_indices:
+        return []
+
+    # Preserve requested order; avoid unnecessary copies when dtypes already int64
+    A_sel = matrix_a[row_indices, :].astype(np.int64, copy=False)
+    B_int = matrix_b.astype(np.int64, copy=False)
+
+    result_rows = A_sel
+    # Perform the same number of right-multiplications as original logic
+    # iterations >= 1 by challenge construction
+    for _ in range(iterations):
+        result_rows = np.dot(result_rows, B_int)
 
     expected_hashes: List[str] = []
-    for row_idx in row_indices:
-        computed_row = result[row_idx]
+    for i in range(result_rows.shape[0]):
+        computed_row = result_rows[i]
         expected_hash = hashlib.sha256(computed_row.tobytes()).hexdigest()[:16]
         expected_hashes.append(expected_hash)
 
@@ -248,8 +291,6 @@ def _verify_challenge_worker(
     proof_data: Dict[str, Any],
     settings: Dict[str, Any],
 ) -> Tuple[bool, Dict[str, Any]]:
-    import bittensor as bt
-
     try:
         challenge_type = challenge_payload.get("challenge_type")
 
@@ -292,8 +333,6 @@ def _verify_challenge_worker(
             )
             if len(row_hashes) != len(expected_hashes) or expected_hashes != row_hashes:
                 return False, {"error": "Row hash mismatch"}
-
-            from neurons.shared.utils.merkle_tree import verify_row_proofs
 
             merkle_valid, merkle_error = verify_row_proofs(
                 row_indices=trusted_rows,
@@ -389,8 +428,6 @@ def _verify_challenge_worker(
                     if not coordinate_values or len(coordinate_values) < required_len:
                         continue
 
-                    import secrets
-
                     crypto_random = secrets.SystemRandom()
                     sample_count = max(1, int(matrix_size * float(row_sample_rate)))
                     shared_sampling_columns = crypto_random.sample(
@@ -451,9 +488,6 @@ def _verify_challenge_worker(
                     ):
                         continue
 
-                    from neurons.shared.utils.merkle_tree import \
-                        verify_row_proofs
-
                     merkle_ok, _ = verify_row_proofs(
                         row_indices=trusted_rows,
                         row_hashes=computed_row_hashes,
@@ -492,20 +526,6 @@ def _verify_challenge_worker(
         return False, {"error": str(e)}
 
 
-import os
-import time
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Tuple
-
-import bittensor as bt
-from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
-
-from neurons.shared.config.config_manager import ConfigManager
-from neurons.validator.challenge_status import ChallengeStatus
-from neurons.validator.models.database import ComputeChallenge, DatabaseManager
-from neurons.validator.services.proof_cache import LRUProofCache
-
-
 class AsyncChallengeVerifier:
     """
     Asynchronous verification service for background challenge verification
@@ -533,6 +553,7 @@ class AsyncChallengeVerifier:
         self.database_manager = database_manager
         self.config = config
         self.proof_cache = proof_cache
+        self._executor_lock = threading.Lock()
 
         # Use CPU cores - 1 to prevent system saturation when configured as -1
         verification_concurrent = config.get("validation.verification_concurrent")
@@ -569,12 +590,7 @@ class AsyncChallengeVerifier:
         self.running = False
         self._verification_task = None
         try:
-            ctx = mp.get_context("spawn")
-            self._executor = concurrent.futures.ProcessPoolExecutor(
-                max_workers=self.concurrent_tasks,
-                mp_context=ctx,
-                initializer=_pool_worker_initializer,
-            )
+            self._executor = self._create_executor()
         except Exception as e:
             bt.logging.error(f"❌ Failed to initialize ProcessPoolExecutor | error={e}")
             raise
@@ -604,11 +620,98 @@ class AsyncChallengeVerifier:
         return self.config.get_positive_number("validation.verification_interval", int)
 
     def _get_concurrent_tasks(self) -> int:
+        # -1 means use CPU count - 1, otherwise use the configured positive value
         configured = self.config.get("validation.verification_concurrent")
+        if not isinstance(configured, int):
+            raise ValueError(
+                f"validation.verification_concurrent must be int, got {type(configured).__name__}"
+            )
         if configured == -1:
             cpu_count = os.cpu_count() or 1
             return max(1, int(cpu_count) - 1)
+        if configured <= 0 and configured != -1:
+            raise ValueError(
+                f"validation.verification_concurrent must be positive or -1, got {configured}"
+            )
         return max(1, int(configured))
+
+    def _create_executor(self) -> concurrent.futures.ProcessPoolExecutor:
+        ctx = mp.get_context("spawn")
+        return concurrent.futures.ProcessPoolExecutor(
+            max_workers=self.concurrent_tasks,
+            mp_context=ctx,
+            initializer=_pool_worker_initializer,
+        )
+
+    def _ensure_executor(self) -> concurrent.futures.ProcessPoolExecutor:
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            return executor
+
+        with self._executor_lock:
+            executor = getattr(self, "_executor", None)
+            if executor is None:
+                self._executor = self._create_executor()
+                executor = self._executor
+        return executor
+
+    def _reset_executor(self) -> None:
+        old_executor = None
+        with self._executor_lock:
+            old_executor = getattr(self, "_executor", None)
+            self._executor = None
+
+        if old_executor is not None:
+            self._shutdown_executor_forceful(old_executor)
+
+        with self._executor_lock:
+            self._executor = self._create_executor()
+
+    def _should_reset_executor(self, exc: Exception) -> bool:
+        if isinstance(exc, BrokenProcessPool):
+            return True
+        if isinstance(exc, RuntimeError):
+            message = str(exc).lower()
+            if "cannot schedule new futures" in message or "shutdown" in message:
+                return True
+        return False
+
+    def _handle_executor_failure(self, error: Exception) -> None:
+        bt.logging.warning(
+            f"⚠️ Verification executor failure detected, recreating pool | error={error}"
+        )
+        self._reset_executor()
+
+    async def _execute_verification_worker(
+        self,
+        challenge_payload: Dict[str, Any],
+        proof_data: Dict[str, Any],
+        settings: Dict[str, Any],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        attempts = 0
+        last_exc: Optional[Exception] = None
+
+        while attempts < 2:
+            executor = self._ensure_executor()
+            loop = asyncio.get_event_loop()
+            try:
+                return await loop.run_in_executor(
+                    executor,
+                    _verify_challenge_worker,
+                    challenge_payload,
+                    proof_data,
+                    settings,
+                )
+            except Exception as exc:
+                if not self._should_reset_executor(exc):
+                    raise
+                last_exc = exc
+                attempts += 1
+                self._handle_executor_failure(exc)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Verification executor unavailable")
 
     async def start(self) -> None:
         """Start the async verification service"""
@@ -616,9 +719,10 @@ class AsyncChallengeVerifier:
             bt.logging.warning("⚠️ AsyncChallengeVerifier already running")
             return
 
+        self._ensure_executor()
         self.running = True
         self._verification_task = asyncio.create_task(self._verification_loop())
-        bt.logging.info("🔄 AsyncChallengeVerifier started")
+        bt.logging.info("🚀 AsyncChallengeVerifier started")
 
     async def stop(self) -> None:
         """Stop the async verification service"""
@@ -635,15 +739,18 @@ class AsyncChallengeVerifier:
 
         # Best-effort executor shutdown with forced terminate of workers
         try:
-            if getattr(self, "_executor", None):
-                self._shutdown_executor_forceful()
+            with self._executor_lock:
+                executor = getattr(self, "_executor", None)
+                self._executor = None
+            if executor:
+                self._shutdown_executor_forceful(executor)
         except Exception as e:
             bt.logging.debug(f"Executor shutdown error ignored | error={e}")
 
-        bt.logging.info("⏹️ AsyncChallengeVerifier stopped")
+        bt.logging.info("AsyncChallengeVerifier stopped")
 
-    def _shutdown_executor_forceful(self) -> None:
-        executor = getattr(self, "_executor", None)
+    def _shutdown_executor_forceful(self, executor=None) -> None:
+        executor = executor or getattr(self, "_executor", None)
         if not executor:
             return
         try:
@@ -725,13 +832,13 @@ class AsyncChallengeVerifier:
 
     def _get_newest_verifying_challenges(self) -> List[ComputeChallenge]:
         """
-        Get newest VERIFYING challenges, and mark stale ones (>1h) failed
+        Get newest VERIFYING challenges, and mark stale ones (>15m) failed
 
         Returns latest-first list limited by concurrency
         """
         try:
             now_utc = datetime.utcnow()
-            stale_cutoff = now_utc - timedelta(hours=1)
+            stale_cutoff = now_utc - timedelta(minutes=15)
 
             with self.database_manager.get_session() as session:
                 # Mark stale challenges as failed
@@ -759,7 +866,7 @@ class AsyncChallengeVerifier:
                         db_challenge.verification_time_ms = 0.0
                         db_challenge.is_success = False
                         db_challenge.verification_notes = (
-                            "Timeout: proof stale (>1h since computed_at)"
+                            "Timeout: proof stale (>15m since computed_at)"
                         )
                         if db_challenge.worker_id:
                             try:
@@ -833,49 +940,6 @@ class AsyncChallengeVerifier:
                 f"start verification | challenge_id={challenge.challenge_id}"
             )
 
-            # Timeout guard: skip stale proofs (> 1 hour since computed_at)
-            try:
-                if challenge.computed_at is not None:
-                    now_utc = datetime.utcnow()
-                    age_seconds = (now_utc - challenge.computed_at).total_seconds()
-                    if age_seconds > 3600:
-                        with self.database_manager.get_session() as session:
-                            db_challenge = session.get(ComputeChallenge, challenge.id)
-                            if db_challenge:
-                                db_challenge.challenge_status = ChallengeStatus.FAILED
-                                db_challenge.verification_result = False
-                                db_challenge.verified_at = now_utc
-                                db_challenge.verification_time_ms = (
-                                    time.time() - verification_start_time
-                                ) * 1000
-                                db_challenge.is_success = False
-                                db_challenge.verification_notes = (
-                                    "Timeout: proof stale (>1h since computed_at)"
-                                )
-                                # Update worker task statistics on timeout
-                                if db_challenge.worker_id:
-                                    try:
-                                        self.database_manager.update_worker_task_statistics(
-                                            session=session,
-                                            hotkey=db_challenge.hotkey,
-                                            worker_id=db_challenge.worker_id,
-                                            is_success=False,
-                                            computation_time_ms=None,
-                                        )
-                                    except Exception:
-                                        pass
-                                session.commit()
-                        # Best-effort cache cleanup for this worker
-                        try:
-                            cache_key = f"{challenge.hotkey}:{challenge.worker_id}"
-                            self.proof_cache.remove_proof(cache_key)
-                        except Exception:
-                            pass
-                        return False, {"error": "stale_timeout"}
-            except Exception:
-                # Non-fatal; continue to verification path
-                pass
-
             # Prepare per-challenge payload and offload verification
             cache_key = f"{challenge.hotkey}:{challenge.worker_id}"
             cached_proof = self.proof_cache.get_proof(cache_key)
@@ -942,10 +1006,7 @@ class AsyncChallengeVerifier:
             }
 
             if do_offload:
-                loop = asyncio.get_event_loop()
-                success, verification_details = await loop.run_in_executor(
-                    self._executor,
-                    _verify_challenge_worker,
+                success, verification_details = await self._execute_verification_worker(
                     challenge_payload,
                     proof_data,
                     settings,

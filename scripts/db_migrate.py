@@ -69,10 +69,10 @@ def check_postgresql_connection(db_config: dict) -> bool:
             database="postgres",  # Connect to default database
         )
         conn.close()
-        bt.logging.info("✓ PostgreSQL connection successful")
+        bt.logging.info("✅ PostgreSQL connection successful")
         return True
     except Exception as e:
-        bt.logging.error(f"✗ PostgreSQL connection failed: {e}")
+        bt.logging.error(f"❌ PostgreSQL connection failed: {e}")
         return False
 
 
@@ -121,10 +121,10 @@ def create_database(db_config: dict) -> bool:
         cursor.close()
         conn.close()
 
-        bt.logging.info(f"✓ Database '{db_config['database']}' created successfully")
+        bt.logging.info(f"✅ Database '{db_config['database']}' created successfully")
         return True
     except Exception as e:
-        bt.logging.error(f"✗ Failed to create database: {e}")
+        bt.logging.error(f"❌ Failed to create database: {e}")
         return False
 
 
@@ -164,10 +164,10 @@ def drop_database(db_config: dict, force: bool = False) -> bool:
         cursor.close()
         conn.close()
 
-        bt.logging.info(f"✓ Database '{db_config['database']}' deleted successfully")
+        bt.logging.info(f"✅ Database '{db_config['database']}' deleted successfully")
         return True
     except Exception as e:
-        bt.logging.error(f"✗ Failed to delete database: {e}")
+        bt.logging.error(f"❌ Failed to delete database: {e}")
         return False
 
 
@@ -186,12 +186,12 @@ def run_alembic_command(
         )
 
         if result.returncode == 0:
-            bt.logging.info("✓ Alembic command executed successfully")
+            bt.logging.info("✅ Alembic command executed successfully")
             if result.stdout:
                 bt.logging.info(result.stdout)
             return True
         else:
-            bt.logging.error("✗ Alembic command execution failed")
+            bt.logging.error("❌ Alembic command execution failed")
             if result.stderr:
                 bt.logging.error(result.stderr)
             return False
@@ -329,9 +329,9 @@ def main():
             sys.exit(1)
 
         if database_exists(db_config):
-            bt.logging.info(f"✓ Database '{db_config['database']}' exists")
+            bt.logging.info(f"✅ Database '{db_config['database']}' exists")
         else:
-            bt.logging.warning(f"✗ Database '{db_config['database']}' does not exist")
+            bt.logging.warning(f"⚠️ Database '{db_config['database']}' does not exist")
 
     elif args.command == "create-db":
         if not database_url.startswith("postgresql://"):

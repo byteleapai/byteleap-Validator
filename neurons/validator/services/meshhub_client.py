@@ -5,12 +5,14 @@ import base64
 import hashlib
 import json
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import bittensor as bt
+from sqlalchemy import tuple_
 
 from neurons.shared.config.config_manager import ConfigManager
 from neurons.shared.crypto import CryptoManager
@@ -30,8 +32,21 @@ class _SessionState:
     seq_out: int = 0
 
 
+@dataclass
+class _EnrollTokenCacheEntry:
+    token: Optional[str]
+    enrollment_url: Optional[str]
+    expires_at_iso: Optional[str]
+    cache_valid_until: datetime
+    pending: bool = False
+
+
 class MeshHubClient:
     """WebSocket client for MeshHub with session encryption."""
+
+    ENROLL_TOKEN_PENDING_TTL_SECONDS = 60
+    ENROLL_TOKEN_RETRY_SECONDS = 5
+    ENROLL_TOKEN_CACHE_OFFSET = timedelta(minutes=5)
 
     @staticmethod
     def validate_config(config: ConfigManager) -> None:
@@ -89,19 +104,27 @@ class MeshHubClient:
         self.config = config
         self.db = db_manager
 
-        self.ws_url = self.config.get("meshhub.ws_url")
-        self.access_token = self.config.get("meshhub.access_token")
-        self.capabilities = self.config.get("meshhub.capabilities")
-        self.reconnect_delay = int(self.config.get("meshhub.reconnect_delay_seconds"))
-        self.heartbeat_interval = int(
-            self.config.get("meshhub.heartbeat_interval_seconds")
+        # Validate configuration before loading values
+        self.validate_config(config)
+
+        # Load validated configuration values
+        self.ws_url = self.config.get_non_empty_string("meshhub.ws_url")
+        self.access_token = self.config.get_non_empty_string("meshhub.access_token")
+        self.capabilities = self.config.get_list("meshhub.capabilities", min_length=1)
+        self.reconnect_delay = self.config.get_positive_number(
+            "meshhub.reconnect_delay_seconds", int
         )
-        self.resource_report_interval = int(
-            self.config.get("meshhub.resource_report_interval_seconds")
+        self.heartbeat_interval = self.config.get_positive_number(
+            "meshhub.heartbeat_interval_seconds", int
+        )
+        self.resource_report_interval = self.config.get_positive_number(
+            "meshhub.resource_report_interval_seconds", int
         )
 
         self.crypto = CryptoManager(self.wallet)
         self.session: Optional[_SessionState] = None
+        self._enroll_token_cache: Dict[str, _EnrollTokenCacheEntry] = {}
+        self._enroll_token_lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._hb_task: Optional[asyncio.Task] = None
@@ -138,6 +161,10 @@ class MeshHubClient:
         """UTC timestamp in ISO-8601 with 'Z' suffix (UTC)."""
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    def _utc_now(self) -> datetime:
+        """Current UTC time as timezone-aware datetime."""
+        return datetime.now(timezone.utc)
+
     def _to_iso_utc(self, dt: Optional[datetime]) -> Optional[str]:
         """Convert datetime to UTC ISO-8601 string with 'Z' offset (Instant-compatible)."""
         if not dt:
@@ -165,7 +192,7 @@ class MeshHubClient:
         self._task = asyncio.create_task(self._run_loop())
         self._hb_task = asyncio.create_task(self._heartbeat_loop())
         self._rs_task = asyncio.create_task(self._resource_report_loop())
-        bt.logging.info(f"🕸️ MeshHub client started | url={self.ws_url}")
+        bt.logging.info(f"🚀 MeshHub client started | url={self.ws_url}")
 
     async def stop(self) -> None:
         """Stop client quickly and unblock any pending websocket recv."""
@@ -203,7 +230,7 @@ class MeshHubClient:
                 except Exception:
                     pass
 
-        bt.logging.info("🕸️ MeshHub client stopped")
+        bt.logging.info("MeshHub client stopped")
 
     async def _run_loop(self) -> None:
         import websockets
@@ -344,6 +371,8 @@ class MeshHubClient:
                 await self._handle_config_update(ws, msg, data)
             elif dtype == "MESH_TASK_PUBLISH_V1":
                 await self._handle_task_publish(ws, msg, data)
+            elif dtype == "MESH_VMGW_ENROLL_TOKEN_RESPONSE_V1":
+                await self._handle_enroll_token_response(data)
             else:
                 bt.logging.debug(f"MeshHub unknown type | type={dtype}")
 
@@ -396,10 +425,10 @@ class MeshHubClient:
                         for c in changes
                     )
                     bt.logging.info(
-                        f"📊 Lease sync | updated={updated} changes=[{change_str}]"
+                        f"✅ Lease sync | updated={updated} changes=[{change_str}]"
                     )
                 else:
-                    bt.logging.info(f"📊 Lease sync | updated={updated}")
+                    bt.logging.info(f"✅ Lease sync | updated={updated}")
         except Exception as e:
             bt.logging.error(f"❌ Lease sync failed | error={e}")
 
@@ -497,7 +526,7 @@ class MeshHubClient:
                 )
             except Exception:
                 updates_json = str(diffs)
-            bt.logging.info(f"⚙️ Config merged | updates={updates_json}")
+            bt.logging.info(f"✅ Config merged | updates={updates_json}")
             ack_id = msg.get("messageId")
             if ack_id:
                 await self._send_ack(
@@ -557,7 +586,7 @@ class MeshHubClient:
                     expires_at=expires_at,
                     status="pending",
                 )
-            bt.logging.info(f"🧾 Mesh task stored | id={task_key} type={task_type}")
+            bt.logging.info(f"✅ Mesh task stored | id={task_key} type={task_type}")
         except Exception as e:
             bt.logging.error(f"❌ Store mesh task failed | id={task_key} error={e}")
 
@@ -830,41 +859,32 @@ class MeshHubClient:
 
     def _build_worker_payload(
         self,
-        session,
         w,
+        hardware,
+        gpu_devices,
+        heartbeat,
         include_hardware: bool,
     ) -> Dict[str, Any]:
-        from neurons.validator.models.database import (GPUInventory,
-                                                       HardwareInfo,
-                                                       HeartbeatRecord)
-
-        hw = (
-            session.query(HardwareInfo)
-            .filter(
-                HardwareInfo.hotkey == w.hotkey,
-                HardwareInfo.worker_id == w.worker_id,
-                HardwareInfo.deleted_at.is_(None),
-            )
-            .first()
-        )
-        gpus = (
-            session.query(GPUInventory)
-            .filter(
-                GPUInventory.hotkey == w.hotkey,
-                GPUInventory.worker_id == w.worker_id,
-                GPUInventory.deleted_at.is_(None),
-            )
-            .all()
-        )
-
-        gpu_list = [g.gpu_info for g in gpus if g.gpu_info is not None]
+        gpu_list = [g.gpu_info for g in gpu_devices if g.gpu_info is not None]
         hardware_full = {
-            "cpu": (hw.cpu_info if hw and hw.cpu_info is not None else {}),
-            "memory": (hw.memory_info if hw and hw.memory_info is not None else {}),
-            "storage": (hw.storage_info if hw and hw.storage_info is not None else []),
+            "cpu": (
+                hardware.cpu_info if hardware and hardware.cpu_info is not None else {}
+            ),
+            "memory": (
+                hardware.memory_info
+                if hardware and hardware.memory_info is not None
+                else {}
+            ),
+            "storage": (
+                hardware.storage_info
+                if hardware and hardware.storage_info is not None
+                else []
+            ),
             "gpus": gpu_list,
             "mb_info": (
-                hw.motherboard_info if hw and hw.motherboard_info is not None else {}
+                hardware.motherboard_info
+                if hardware and hardware.motherboard_info is not None
+                else {}
             ),
         }
 
@@ -872,29 +892,24 @@ class MeshHubClient:
         avg_cpu = None
         avg_mem = None
         public_ip = None
-        try:
-            last_hb = (
-                session.query(HeartbeatRecord)
-                .filter(
-                    HeartbeatRecord.hotkey == w.hotkey,
-                    HeartbeatRecord.worker_id == w.worker_id,
-                    HeartbeatRecord.deleted_at.is_(None),
-                )
-                .order_by(HeartbeatRecord.created_at.desc())
-                .first()
-            )
-            if last_hb is not None:
+        if heartbeat is not None:
+            try:
                 avg_cpu = (
-                    float(last_hb.cpu_usage) if last_hb.cpu_usage is not None else None
-                )
-                avg_mem = (
-                    float(last_hb.memory_usage)
-                    if last_hb.memory_usage is not None
+                    float(heartbeat.cpu_usage)
+                    if heartbeat.cpu_usage is not None
                     else None
                 )
-                public_ip = last_hb.public_ip
-        except Exception:
-            pass
+            except Exception:
+                avg_cpu = None
+            try:
+                avg_mem = (
+                    float(heartbeat.memory_usage)
+                    if heartbeat.memory_usage is not None
+                    else None
+                )
+            except Exception:
+                avg_mem = None
+            public_ip = heartbeat.public_ip
 
         net_obj: Dict[str, Any] = {}
         if public_ip:
@@ -917,11 +932,17 @@ class MeshHubClient:
             },
             # Uptime comes from worker hardware record
             "uptimeSeconds": (
-                int(hw.uptime_seconds) if hw and hw.uptime_seconds else None
+                int(hardware.uptime_seconds)
+                if hardware and hardware.uptime_seconds
+                else None
             ),
             # Network object handled same as os_info: include object as-is
             "network": net_obj,
-            "os_info": (hw.system_info if hw and hw.system_info is not None else {}),
+            "os_info": (
+                hardware.system_info
+                if hardware and hardware.system_info is not None
+                else {}
+            ),
         }
         if include_hardware:
             payload["hardware"] = hardware_full
@@ -954,7 +975,11 @@ class MeshHubClient:
         Returns (payload, changed). For delta mode, changed=False means no diffs found.
         """
         try:
-            from neurons.validator.models.database import MinerInfo, WorkerInfo
+            from neurons.validator.models.database import (GPUInventory,
+                                                           HardwareInfo,
+                                                           HeartbeatRecord,
+                                                           MinerInfo,
+                                                           WorkerInfo)
 
             miners_out: List[Dict[str, Any]] = []
             changed_any = False
@@ -970,26 +995,98 @@ class MeshHubClient:
                     .all()
                 )
 
-                for m in miner_rows:
-                    workers = (
-                        session.query(WorkerInfo)
-                        .filter(
-                            WorkerInfo.hotkey == m.hotkey,
-                            WorkerInfo.deleted_at.is_(None),
-                        )
-                        .all()
+                if not miner_rows:
+                    return (
+                        {"miners": [], "mode": "full" if full else "delta"},
+                        False,
+                        {"workers": {}},
                     )
 
-                    worker_list: List[Dict[str, Any]] = []
-                    for w in workers:
-                        wk_key = f"{w.hotkey}:{w.worker_id}"
+                hotkeys = [m.hotkey for m in miner_rows]
+                workers = (
+                    session.query(WorkerInfo)
+                    .filter(
+                        WorkerInfo.hotkey.in_(hotkeys),
+                        WorkerInfo.deleted_at.is_(None),
+                    )
+                    .all()
+                )
 
-                        # For delta: compute both state and hardware hashes to decide inclusion
-                        # Build full worker payload first, but we may omit hardware for delta when unchanged
-                        # First, build with hardware to compute hw hash
+                workers_by_hotkey: Dict[str, List[WorkerInfo]] = defaultdict(list)
+                for worker in workers:
+                    workers_by_hotkey[worker.hotkey].append(worker)
+
+                worker_pairs = list(
+                    {(w.hotkey, w.worker_id) for w in workers if w.worker_id}
+                )
+
+                hardware_rows = (
+                    session.query(HardwareInfo)
+                    .filter(HardwareInfo.deleted_at.is_(None))
+                    .filter(
+                        tuple_(HardwareInfo.hotkey, HardwareInfo.worker_id).in_(
+                            worker_pairs
+                        )
+                        if worker_pairs
+                        else False
+                    )
+                    .all()
+                )
+                hardware_map = {
+                    (row.hotkey, row.worker_id): row for row in hardware_rows
+                }
+
+                gpu_rows = (
+                    session.query(GPUInventory)
+                    .filter(GPUInventory.deleted_at.is_(None))
+                    .filter(
+                        tuple_(GPUInventory.hotkey, GPUInventory.worker_id).in_(
+                            worker_pairs
+                        )
+                        if worker_pairs
+                        else False
+                    )
+                    .all()
+                )
+                gpu_map: Dict[Tuple[str, str], List[GPUInventory]] = defaultdict(list)
+                for gpu in gpu_rows:
+                    gpu_map[(gpu.hotkey, gpu.worker_id)].append(gpu)
+
+                heartbeat_rows = (
+                    session.query(HeartbeatRecord)
+                    .distinct(HeartbeatRecord.hotkey, HeartbeatRecord.worker_id)
+                    .filter(HeartbeatRecord.deleted_at.is_(None))
+                    .filter(
+                        tuple_(HeartbeatRecord.hotkey, HeartbeatRecord.worker_id).in_(
+                            worker_pairs
+                        )
+                        if worker_pairs
+                        else False
+                    )
+                    .order_by(
+                        HeartbeatRecord.hotkey,
+                        HeartbeatRecord.worker_id,
+                        HeartbeatRecord.created_at.desc(),
+                    )
+                    .all()
+                )
+                heartbeat_map = {(hb.hotkey, hb.worker_id): hb for hb in heartbeat_rows}
+
+                for miner in miner_rows:
+                    worker_list: List[Dict[str, Any]] = []
+                    for worker in workers_by_hotkey.get(miner.hotkey, []):
+                        wk_key = f"{worker.hotkey}:{worker.worker_id}"
+                        cache_key = (worker.hotkey, worker.worker_id)
+
+                        hardware = hardware_map.get(cache_key)
+                        gpu_devices = gpu_map.get(cache_key, [])
+                        heartbeat = heartbeat_map.get(cache_key)
+
                         full_payload = self._build_worker_payload(
-                            session,
-                            w,
+                            worker,
+                            hardware,
+                            gpu_devices,
+                            heartbeat,
                             include_hardware=True,
                         )
                         hashes = self._build_worker_hashes(full_payload)
@@ -1001,34 +1098,26 @@ class MeshHubClient:
                         )
 
                         if full or state_changed or hw_changed:
-                            # For delta, omit hardware if it hasn't changed to reduce payload size
                             include_hw = full or hw_changed
                             if include_hw:
                                 worker_payload = full_payload
                             else:
-                                worker_payload = self._build_worker_payload(
-                                    session,
-                                    w,
-                                    include_hardware=False,
-                                )
+                                worker_payload = dict(full_payload)
+                                worker_payload.pop("hardware", None)
                             worker_list.append(worker_payload)
-                            # Queue hash updates to apply after send
                             pending_updates["workers"][wk_key] = {
                                 "state": hashes["state"],
-                                "hardware": hashes["hardware"] if include_hw else None,
+                                "hardware": hashes["hardware"],
                             }
 
-                    # Always include miner record when sending (full or delta)
-                    # For delta, miner may have empty workers list if no worker changed
                     miners_out.append(
                         {
-                            "hotkey": m.hotkey,
-                            "status": "ACTIVE" if m.is_online else "OFFLINE",
-                            "version": m.miner_version or None,
+                            "hotkey": miner.hotkey,
+                            "status": "ACTIVE" if miner.is_online else "OFFLINE",
+                            "version": miner.miner_version or None,
                             "workers": worker_list,
                         }
                     )
-                    # Only worker changes determine whether to send delta
                     changed_any = changed_any or bool(worker_list)
 
             payload: Dict[str, Any] = {
@@ -1055,6 +1144,145 @@ class MeshHubClient:
             return text if text else "unknown"
         except Exception:
             return "unknown"
+
+    def _cleanup_enroll_cache(self, now: Optional[datetime] = None) -> None:
+        """Remove expired enroll token cache entries (caller holds lock)."""
+        now = now or self._utc_now()
+        expired = [
+            key
+            for key, entry in self._enroll_token_cache.items()
+            if entry.cache_valid_until <= now
+        ]
+        for key in expired:
+            self._enroll_token_cache.pop(key, None)
+
+    @staticmethod
+    def _parse_iso8601(value: str) -> datetime:
+        """Parse ISO-8601 string with optional trailing 'Z'."""
+        if not value:
+            raise ValueError("timestamp is empty")
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+
+    async def acquire_enroll_token(
+        self, hotkey: str
+    ) -> Tuple[str, Optional[Dict[str, str]]]:
+        """
+        Retrieve or request a VM gateway enroll token for a miner hotkey.
+
+        Returns:
+            state: one of {"ready", "pending", "unavailable"}
+            payload: token data when state == "ready"
+        """
+        if not hotkey:
+            return "unavailable", None
+
+        async with self._enroll_token_lock:
+            now = self._utc_now()
+            self._cleanup_enroll_cache(now)
+            entry = self._enroll_token_cache.get(hotkey)
+            if entry and entry.cache_valid_until > now:
+                if entry.pending:
+                    return "pending", None
+                return (
+                    "ready",
+                    {
+                        "token": entry.token,
+                        "expires_at": entry.expires_at_iso,
+                        "enrollment_url": entry.enrollment_url,
+                    },
+                )
+
+            if not self.session:
+                return "unavailable", None
+
+            pending_entry = _EnrollTokenCacheEntry(
+                token=None,
+                enrollment_url=None,
+                expires_at_iso=None,
+                cache_valid_until=now
+                + timedelta(seconds=self.ENROLL_TOKEN_PENDING_TTL_SECONDS),
+                pending=True,
+            )
+            self._enroll_token_cache[hotkey] = pending_entry
+
+        try:
+            bt.logging.debug(f"Requesting VMGW enroll token | hotkey={hotkey}")
+            await self._send_enroll_token_request(hotkey)
+        except Exception as e:
+            bt.logging.error(
+                f"❌ VMGW enroll token request send failed | hotkey={hotkey} | error={e}"
+            )
+            async with self._enroll_token_lock:
+                current = self._enroll_token_cache.get(hotkey)
+                if current and current.pending:
+                    self._enroll_token_cache.pop(hotkey, None)
+            return "unavailable", None
+
+        return "pending", None
+
+    async def _send_enroll_token_request(self, hotkey: str) -> None:
+        """Send enroll token request to MeshHub over encrypted channel."""
+        payload = {"hotkey": hotkey}
+        await self._send_encrypted_ws("MESH_VMGW_ENROLL_TOKEN_REQUEST_V1", payload)
+
+    async def _handle_enroll_token_response(self, data: Dict[str, Any]) -> None:
+        """Process enroll token response pushed from MeshHub."""
+        hotkey = (data.get("hotkey") or "").strip()
+        token = data.get("token")
+        expires_at = data.get("expiresAt")
+        enrollment_url = data.get("enrollmentUrl")
+
+        if not hotkey:
+            bt.logging.warning("⚠️ VMGW enroll token response missing hotkey")
+            return
+
+        if not token or not expires_at or not enrollment_url:
+            bt.logging.warning(
+                f"⚠️ VMGW enroll token response incomplete | hotkey={hotkey}"
+            )
+            async with self._enroll_token_lock:
+                current = self._enroll_token_cache.get(hotkey)
+                if current and current.pending:
+                    self._enroll_token_cache.pop(hotkey, None)
+            return
+
+        try:
+            expires_at_dt = self._parse_iso8601(expires_at)
+        except Exception as e:
+            bt.logging.warning(
+                f"⚠️ VMGW enroll token expiry parse failed | hotkey={hotkey} | error={e}"
+            )
+            async with self._enroll_token_lock:
+                current = self._enroll_token_cache.get(hotkey)
+                if current and current.pending:
+                    self._enroll_token_cache.pop(hotkey, None)
+            return
+
+        now = self._utc_now()
+        cache_valid_until = expires_at_dt - self.ENROLL_TOKEN_CACHE_OFFSET
+        if cache_valid_until <= now:
+            cache_valid_until = expires_at_dt
+
+        entry = _EnrollTokenCacheEntry(
+            token=token,
+            enrollment_url=enrollment_url,
+            expires_at_iso=expires_at,
+            cache_valid_until=cache_valid_until,
+            pending=False,
+        )
+
+        async with self._enroll_token_lock:
+            self._enroll_token_cache[hotkey] = entry
+
+        bt.logging.info(
+            f"✅ VMGW enroll token cached | hotkey={hotkey} expires_at={expires_at}"
+        )
 
     async def publish_score_report(
         self,

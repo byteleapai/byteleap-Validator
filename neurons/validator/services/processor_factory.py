@@ -55,3 +55,25 @@ class ValidatorProcessorFactory:
                 return await self.handler(request_data, peer_hotkey)
 
         return TaskProcessor(self.communicator, handler_func)
+
+    def create_vmgw_enroll_token_processor(self, handler_func) -> SynapseProcessor:
+        from neurons.shared.protocols import (GetVmgwEnrollTokenRequest,
+                                              GetVmgwEnrollTokenSynapse)
+
+        class VmgwEnrollTokenProcessor(SynapseProcessor):
+            def __init__(self, communicator, handler):
+                super().__init__(communicator)
+                self.handler = handler
+
+            @property
+            def synapse_type(self):
+                return GetVmgwEnrollTokenSynapse
+
+            @property
+            def request_class(self):
+                return GetVmgwEnrollTokenRequest
+
+            async def process_request(self, request_data, peer_hotkey):
+                return await self.handler(request_data, peer_hotkey)
+
+        return VmgwEnrollTokenProcessor(self.communicator, handler_func)

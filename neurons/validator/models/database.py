@@ -4,14 +4,30 @@ Define PostgreSQL database models for storing miner information
 """
 
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import bittensor as bt
 from sqlalchemy import (JSON, Boolean, Column, DateTime, Float, ForeignKey,
                         Index, Integer, String, Text, create_engine, or_, text)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
+from sqlalchemy.types import TypeDecorator
+
+
+class JSONType(TypeDecorator):
+    """Dialect-aware JSON type: JSONB for PostgreSQL, JSON for others (SQLite)."""
+
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(JSONB())
+        return dialect.type_descriptor(JSON())
+
 
 Base = declarative_base()
 
@@ -34,7 +50,7 @@ class WorkerInfo(Base):
     # Worker metadata
     worker_name = Column(String(128), nullable=True)
     worker_version = Column(String(32))
-    capabilities = Column(JSON, default=list)
+    capabilities = Column(JSONType, default=list)
 
     # Network status
     is_online = Column(Boolean, default=False)
@@ -138,34 +154,34 @@ class HardwareInfo(Base):
     cpu_architecture = Column(String(64))
     cpu_frequency_mhz = Column(Float)
     cpu_max_frequency_mhz = Column(Float)
-    cpu_info = Column(JSON)
+    cpu_info = Column(JSONType)
 
     # Memory information
     memory_total_mb = Column(Integer)
     memory_type = Column(String(32))
     memory_frequency_mhz = Column(Float)
-    memory_info = Column(JSON)
+    memory_info = Column(JSONType)
 
     # Storage information
     disk_total_gb = Column(Integer)
     disk_type = Column(String(32))
-    storage_info = Column(JSON)
+    storage_info = Column(JSONType)
 
     # GPU information
     gpu_count = Column(Integer, default=0)
-    gpu_info = Column(JSON)
+    gpu_info = Column(JSONType)
 
     # Motherboard information
     motherboard_brand = Column(String(128))
     motherboard_model = Column(String(256))
     motherboard_bios_version = Column(String(128))
-    motherboard_info = Column(JSON)
+    motherboard_info = Column(JSONType)
 
     # System information
     system_os = Column(String(128))
     system_os_version = Column(String(128))
     system_kernel_version = Column(String(128))
-    system_info = Column(JSON)
+    system_info = Column(JSONType)
     uptime_seconds = Column(Float)
 
     # Performance metrics
@@ -228,7 +244,7 @@ class GPUInventory(Base):
     last_seen_at = Column(DateTime, default=datetime.utcnow)
 
     # Additional GPU info
-    gpu_info = Column(JSON, nullable=True)  # Extended GPU information
+    gpu_info = Column(JSONType, nullable=True)  # Extended GPU information
 
     # Audit fields
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -275,7 +291,7 @@ class HeartbeatRecord(Base):
     memory_usage = Column(Float)
     memory_available_mb = Column(Integer)
     disk_free_gb = Column(Integer)
-    gpu_utilization = Column(JSON)
+    gpu_utilization = Column(JSONType)
 
     # Network information
     public_ip = Column(String(45))
@@ -307,6 +323,7 @@ class HeartbeatRecord(Base):
             "created_at",
             postgresql_where=text("deleted_at IS NULL"),
             postgresql_include=["public_ip"],
+            sqlite_where=text("deleted_at IS NULL"),
         ),
     )
 
@@ -324,18 +341,18 @@ class ComputeChallenge(Base):
 
     # Challenge configuration
     challenge_type = Column(String(32), nullable=False)
-    challenge_data = Column(JSON, nullable=False)
+    challenge_data = Column(JSONType, nullable=False)
     sent_at = Column(DateTime, nullable=True, index=True)
     expires_at = Column(DateTime, nullable=True)
 
     # Phase 1 Response
     computation_time_ms = Column(Float)
     computed_at = Column(DateTime)
-    merkle_commitments = Column(JSON, nullable=True)
+    merkle_commitments = Column(JSONType, nullable=True)
 
     # Phase 2 Response
-    verification_targets = Column(JSON, nullable=True)
-    debug_info = Column(JSON, nullable=True)
+    verification_targets = Column(JSONType, nullable=True)
+    debug_info = Column(JSONType, nullable=True)
 
     # Verification information
     challenge_status = Column(String(20), nullable=False)
@@ -394,7 +411,7 @@ class MeshHubTask(Base):
 
     # Task details
     task_type = Column(String(32), nullable=False)
-    task_config = Column(JSON, nullable=False)
+    task_config = Column(JSONType, nullable=False)
     priority = Column(Integer, default=0)
 
     # Task status
@@ -488,8 +505,8 @@ class NetworkLog(Base):
     client_port = Column(Integer)
 
     # Data storage
-    raw_synapse_data = Column(JSON)
-    decrypted_data = Column(JSON)
+    raw_synapse_data = Column(JSONType)
+    decrypted_data = Column(JSONType)
 
     # Encryption metadata
     encryption_method = Column(String(32), default="session")
@@ -497,7 +514,7 @@ class NetworkLog(Base):
     # Processing results
     error_code = Column(Integer, default=0)  # 0 = success, non-zero = error codes
     error_message = Column(Text)
-    response_data = Column(JSON)
+    response_data = Column(JSONType)
     processing_time_ms = Column(Float)
 
     # Audit fields
@@ -534,7 +551,7 @@ class DatabaseManager:
             self.engine = create_engine(database_url, pool_pre_ping=True)
         else:
             self.engine = create_engine(
-                database_url, pool_pre_ping=True, pool_size=10, max_overflow=20
+                database_url, pool_pre_ping=True, pool_size=32, max_overflow=20
             )
         self.SessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=self.engine
@@ -559,10 +576,10 @@ class DatabaseManager:
         retention_days: int = 7,
         min_heartbeat_hours: Optional[int] = None,
     ) -> Dict[str, int]:
-        """Hard-delete old rows from event/log tables only.
+        """Hard-delete old rows according to retention policy.
 
         Scope (created_at cutoff):
-        - network_logs, heartbeat_records, compute_challenges, meshhub_tasks, network_weights
+        - network_logs, heartbeat_records, compute_challenges, meshhub_tasks, network_weights, worker_info
 
         Heartbeats use a stricter cutoff to preserve at least the availability window
         (min_heartbeat_hours), preventing availability calculation bias when retention_days is small.
@@ -598,6 +615,16 @@ class DatabaseManager:
             )
         except Exception:
             deleted["heartbeat_records"] = 0
+
+        # Worker info cleanup based on last_heartbeat
+        try:
+            deleted["worker_info"] = (
+                session.query(WorkerInfo)
+                .filter(WorkerInfo.last_heartbeat < hb_cutoff)
+                .delete(synchronize_session=False)
+            )
+        except Exception:
+            deleted["worker_info"] = 0
 
         try:
             deleted["compute_challenges"] = (
@@ -1713,6 +1740,48 @@ class DatabaseManager:
             )
             .all()
         )
+
+    def get_gpu_inventory_for_workers(
+        self, session: Session, hotkey: str, worker_ids: List[str]
+    ) -> Dict[str, List[GPUInventory]]:
+        """Batch fetch GPU inventory for multiple workers under same hotkey."""
+        if not worker_ids:
+            return {}
+        rows = (
+            session.query(GPUInventory)
+            .filter(
+                GPUInventory.hotkey == hotkey,
+                GPUInventory.worker_id.in_(worker_ids),
+                GPUInventory.deleted_at.is_(None),
+            )
+            .all()
+        )
+        inventory_map: Dict[str, List[GPUInventory]] = defaultdict(list)
+        for row in rows:
+            inventory_map[row.worker_id].append(row)
+        return inventory_map
+
+    def get_workers_with_pending_challenges(
+        self,
+        session: Session,
+        hotkey: str,
+        worker_ids: List[str],
+        pending_states: List[str],
+    ) -> Set[str]:
+        """Return worker_ids that currently have pending challenges."""
+        if not worker_ids:
+            return set()
+        rows = (
+            session.query(ComputeChallenge.worker_id)
+            .filter(
+                ComputeChallenge.hotkey == hotkey,
+                ComputeChallenge.worker_id.in_(worker_ids),
+                ComputeChallenge.challenge_status.in_(pending_states),
+                ComputeChallenge.deleted_at.is_(None),
+            )
+            .all()
+        )
+        return {worker_id for (worker_id,) in rows}
 
     def get_gpu_by_uuid(
         self, session: Session, gpu_uuid: str

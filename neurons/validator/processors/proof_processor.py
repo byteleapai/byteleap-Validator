@@ -4,6 +4,7 @@ Handles Phase 2 of two-phase verification: proof data storage only
 Actual verification is handled by AsyncChallengeVerifier
 """
 
+import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Type
 
@@ -61,6 +62,14 @@ class ProofProcessor(SynapseProcessor):
         Process a unified proof submission (Phase 2).
         Store proof data and mark challenge as committed for async verification.
         """
+        return await asyncio.to_thread(
+            self._process_request_sync, proof_data, peer_hotkey
+        )
+
+    def _process_request_sync(
+        self, proof_data: ProofData, peer_hotkey: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Blocking proof storage executed off the event loop."""
         try:
             challenge_id = proof_data.challenge_id
             proofs = proof_data.proofs
@@ -143,7 +152,6 @@ class ProofProcessor(SynapseProcessor):
                     challenge.debug_info = proof_data.debug_info
 
                 # Mark as verifying for async verification
-                challenge.computed_at = datetime.utcnow()
                 challenge.challenge_status = ChallengeStatus.VERIFYING
 
                 session.commit()

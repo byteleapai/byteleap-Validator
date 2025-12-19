@@ -40,7 +40,7 @@ class DataCleanupService:
         self._running = True
         # Start background scheduler
         self._task = asyncio.create_task(self._loop())
-        bt.logging.info("🧹 Data cleanup scheduler started")
+        bt.logging.info("🚀 Data cleanup scheduler started")
 
     async def stop(self) -> None:
         if not self._running:
@@ -53,7 +53,7 @@ class DataCleanupService:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        bt.logging.info("🧹 Data cleanup scheduler stopped")
+        bt.logging.info("✅ Data cleanup scheduler stopped")
 
     async def _loop(self) -> None:
         while self._running:

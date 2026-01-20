@@ -41,8 +41,6 @@ class ProtocolTypes:
 
     HEARTBEAT = "HEARTBEAT_V1"
     TASK = "TASK_V1"
-    CHALLENGE = "CHALLENGE_V1"
-    CHALLENGE_PROOF = "CHALLENGE_PROOF_V1"
     SESSION_INIT = "SESSION_INIT_V1"
     GET_VMGW_ENROLL_TOKEN = "GET_VMGW_ENROLL_TOKEN_V1"
 
@@ -61,7 +59,6 @@ class ErrorCodes:
     NETWORK_ERROR = 1003
     HEARTBEAT_PROCESSING_FAILED = 1004
     TASK_PROCESSING_FAILED = 1005
-    CHALLENGE_PROCESSING_FAILED = 1006
 
     # Configuration errors (2000-2099)
     CONFIG_MISSING_KEY = 2000
@@ -168,34 +165,6 @@ class HeartbeatData(StrictModel):
     )
 
 
-class ComputeChallenge(StrictModel):
-    """Compute challenge task"""
-
-    challenge_id: str = Field(default="", description="Challenge ID")
-    challenge_type: Literal["cpu_matrix", "gpu_matrix"] = Field(
-        default="cpu_matrix", description="Challenge type (cpu_matrix, gpu_matrix)"
-    )
-    data: Dict[str, Any] = Field(default_factory=dict, description="Challenge data")
-    timeout: int = Field(
-        default=45, ge=1, le=300, description="Timeout duration in seconds (1-300)"
-    )
-    target_worker_id: Optional[str] = Field(
-        default=None,
-        description="Target specific worker (None = distribute to all workers)",
-    )
-
-    @model_validator(mode="after")
-    def validate_challenge(self) -> "ComputeChallenge":
-        """Validate challenge parameters"""
-        if not self.challenge_id.strip():
-            raise ValueError("Challenge ID cannot be empty")
-
-        if self.target_worker_id and not self.target_worker_id.strip():
-            raise ValueError("target_worker_id cannot be empty string")
-
-        return self
-
-
 class TaskRequest(StrictModel):
     """Task request (miner polls tasks)"""
 
@@ -272,158 +241,6 @@ class GetVmgwEnrollTokenSynapse(EncryptedSynapse):
     """Synapse for retrieving VM gateway enroll tokens."""
 
     PROTOCOL_TYPE: ClassVar[str] = ProtocolTypes.GET_VMGW_ENROLL_TOKEN
-
-
-def _is_hex(s: str) -> bool:
-    try:
-        int(s, 16)
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def _is_base64(s: str) -> bool:
-    try:
-        base64.b64decode(s, validate=True)
-        return True
-    except (ValueError, TypeError, binascii.Error):
-        return False
-
-
-class SignatureVersion(IntEnum):
-    CPU = 0
-    GPU = 1
-
-
-class Commitment(StrictModel):
-    """A single commitment object for challenge verification."""
-
-    uuid: str = Field(
-        description="Unique identifier for the computation unit (-1 for CPU, GPU UUID for GPU)"
-    )
-    merkle_root: str = Field(description="The Merkle root hash of the result.")
-    sig_ver: SignatureVersion = Field(
-        default=SignatureVersion.CPU,
-        description="Signature version (0 for CPU, 0x1 for GPU).",
-    )
-    sig_val: Optional[str] = Field(
-        default="",
-        description="ECDSA signature of sig_ver|seed|gpu_uuid|merkle_root (mandatory for GPU, empty for CPU).",
-    )
-
-    @model_validator(mode="after")
-    def validate_commitment(self) -> "Commitment":
-        if not self.uuid:
-            raise ValueError("uuid required")
-        if not _is_hex(self.merkle_root):
-            raise ValueError("merkle_root must be hex")
-        # GPU signatures must be present and base64/hex depending on implementation
-        if self.sig_ver == SignatureVersion.GPU:
-            if not self.sig_val:
-                raise ValueError("GPU commitment requires sig_val")
-            # accept base64 or hex encoded signatures
-            if not (_is_base64(self.sig_val) or _is_hex(self.sig_val)):
-                raise ValueError("sig_val must be base64 or hex encoded")
-        return self
-
-
-class CommitmentData(StrictModel):
-    """Phase 1: Commitment data sent from Miner to Validator."""
-
-    challenge_id: str = Field(description="Unique challenge identifier")
-    worker_id: str = Field(description="Worker that performed the computation")
-    commitments: List[Commitment] = Field(
-        description="A list of commitment objects for each computation unit."
-    )
-    debug_info: Optional[Dict[str, Any]] = Field(
-        default_factory=dict, description="Debug and timestamping information."
-    )
-    schema_version: int = Field(
-        default=1, ge=1, description="Schema version for compatibility"
-    )
-
-
-class ProofRequest(StrictModel):
-    """A single proof request object for Phase 2 verification."""
-
-    uuid: str = Field(description="The UUID of the commitment to verify (-1 for CPU).")
-    rows: Optional[List[int]] = Field(
-        default_factory=list,
-        description="Optional list of row indices to get proofs for.",
-    )
-    coordinates: Optional[List[List[int]]] = Field(
-        default_factory=list,
-        description="Optional list of [row, col] coordinate pairs.",
-    )
-
-    @model_validator(mode="after")
-    def validate_request(self) -> "ProofRequest":
-        if not self.uuid:
-            raise ValueError("uuid required")
-        if not self.rows and not self.coordinates:
-            raise ValueError("rows or coordinates must be provided")
-        if self.rows:
-            if any(r < 0 for r in self.rows):
-                raise ValueError("row indices must be non-negative")
-        if self.coordinates:
-            for coord in self.coordinates:
-                if len(coord) != 2:
-                    raise ValueError("coordinates must be [row, col] pairs")
-                x, y = coord
-                if x < 0 or y < 0:
-                    raise ValueError("coordinate indices must be non-negative")
-        return self
-
-
-class ProofResponse(StrictModel):
-    """A single proof response object for Phase 2 verification."""
-
-    uuid: str = Field(description="The UUID of the commitment being verified.")
-    row_hashes: List[str] = Field(description="Hashes of the requested rows.")
-    merkle_proofs: List[Dict[str, Any]] = Field(
-        description="Merkle proofs for the requested rows."
-    )
-    coordinate_values: List[float] = Field(
-        default_factory=list, description="Values for the requested coordinates."
-    )
-
-
-class ProofData(StrictModel):
-    """Phase 2: Proof data sent from Miner to Validator."""
-
-    challenge_id: str = Field(
-        description="Challenge identifier matching the commitment"
-    )
-    proofs: List[ProofResponse] = Field(
-        description="A list of proof objects, one for each requested proof."
-    )
-    debug_info: Optional[Dict[str, Any]] = Field(
-        default_factory=dict, description="Debug and timestamping information."
-    )
-    schema_version: int = Field(
-        default=1, ge=1, description="Schema version for compatibility"
-    )
-
-
-class ChallengeSynapse(EncryptedSynapse):
-    """
-    Phase 1: Miner sends CommitmentData, Validator responds with a list of ProofRequest objects.
-    """
-
-    PROTOCOL_TYPE: ClassVar[str] = ProtocolTypes.CHALLENGE
-
-    # The validator populates this field in its response to the commitment.
-    proof_requests: Optional[List[ProofRequest]] = Field(
-        default=None, description="A list of proofs the validator wants."
-    )
-
-
-class ChallengeProofSynapse(EncryptedSynapse):
-    """
-    Phase 2: Miner submits proof materials (ProofData) for validator verification.
-    """
-
-    PROTOCOL_TYPE: ClassVar[str] = ProtocolTypes.CHALLENGE_PROOF
 
 
 class HeartbeatResponse(StrictModel):
@@ -547,8 +364,6 @@ class ProtocolRegistry:
 # Register built-in synapses
 ProtocolRegistry.register(HeartbeatSynapse)
 ProtocolRegistry.register(TaskSynapse)
-ProtocolRegistry.register(ChallengeSynapse)
-ProtocolRegistry.register(ChallengeProofSynapse)
 ProtocolRegistry.register(GetVmgwEnrollTokenSynapse)
 ProtocolRegistry.register(SessionInitSynapse)
 
@@ -563,21 +378,12 @@ __all__ = [
     "SystemInfo",
     "WorkerInfo",
     "HeartbeatData",
-    # challenges
-    "ComputeChallenge",
-    "Commitment",
-    "CommitmentData",
-    "ProofRequest",
-    "ProofResponse",
-    "ProofData",
     # synapses
     "EncryptedSynapse",
     "HeartbeatSynapse",
     "TaskSynapse",
     "GetVmgwEnrollTokenRequest",
     "GetVmgwEnrollTokenSynapse",
-    "ChallengeSynapse",
-    "ChallengeProofSynapse",
     "SessionInitSynapse",
     "ProtocolRegistry",
     # session

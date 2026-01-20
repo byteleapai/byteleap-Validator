@@ -71,7 +71,7 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def validate_config(config: ConfigManager) -> bool:
-    """Validate configuration validity using fail-fast config methods"""
+    """Validate configuration validity (lease-only mode)"""
     try:
         # Test required fields by accessing them (will raise KeyError if missing)
         config.get("netuid")
@@ -99,48 +99,8 @@ def validate_config(config: ConfigManager) -> bool:
             )
             return False
 
-        # Validate critical GPU verification parameters
-        try:
-            config.get("validation.gpu.verification.coordinate_sample_count")
-            config.get("validation.gpu.verification.coordinate_sample_count_variance")
-            config.get("validation.gpu.verification.row_verification_count")
-            config.get("validation.gpu.verification.row_verification_count_variance")
-            config.get("validation.gpu.verification.row_sample_rate")
-        except KeyError:
-            pass  # GPU verification is optional if validation section exists
-
-        # Validate critical CPU verification parameters
-        try:
-            config.get("validation.cpu.verification.row_verification_count")
-            config.get("validation.cpu.verification.row_verification_count_variance")
-        except KeyError:
-            pass  # CPU verification is optional if validation section exists
-
-        # Validate verification parameters to prevent "zero proof" issue
-        try:
-            # Check CPU verification
-            cpu_rows = config.get("validation.cpu.verification.row_verification_count")
-            if cpu_rows <= 0:
-                bt.logging.error(
-                    f"Error: CPU row_verification_count must be > 0 to avoid hanging challenges. "
-                    f"Current value: {cpu_rows}"
-                )
-                return False
-
-            # Check GPU verification - at least one method must be enabled
-            gpu_coords = config.get(
-                "validation.gpu.verification.coordinate_sample_count"
-            )
-            gpu_rows = config.get("validation.gpu.verification.row_verification_count")
-            if gpu_coords <= 0 and gpu_rows <= 0:
-                bt.logging.error(
-                    f"Error: At least one GPU verification method must be enabled. "
-                    f"coordinate_sample_count={gpu_coords}, row_verification_count={gpu_rows}"
-                )
-                return False
-
-        except KeyError as e:
-            bt.logging.warning(f"⚠️ Verify params | skip_check err={e}")
+        # Challenge verification parameters removed in lease-only mode
+        # GPU and CPU verification checks are no longer needed
 
         # MeshHub required configuration
         try:
@@ -149,6 +109,17 @@ def validate_config(config: ConfigManager) -> bool:
             bt.logging.error(f"❌ MeshHub config invalid | error={e}")
             return False
 
+        # Validate weight configuration for lease-only mode
+        try:
+            lease_weight = config.get("weight_management.score_weights.lease_weight")
+            if lease_weight != 1.0:
+                bt.logging.warning(
+                    f"⚠️ lease_weight is {lease_weight}, expected 1.0 for lease-only mode"
+                )
+        except KeyError:
+            bt.logging.warning("⚠️ lease_weight not configured, using default")
+
+        bt.logging.info("✅ Config validation passed (lease-only mode)")
         return True
 
     except KeyError as e:

@@ -31,7 +31,6 @@ class CryptoManager:
     HANDSHAKE_TIMEOUT_SECONDS = 30
     HANDSHAKE_RETRY_BACKOFF_SECONDS = 5
     NEAR_EXPIRY_THRESHOLD_SECONDS = 300
-    USED_CHALLENGE_CLEANUP_INTERVAL_SECONDS = 3600
 
     def __init__(self, wallet: bt.wallet):
         """

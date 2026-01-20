@@ -771,9 +771,7 @@ class MeshHubClient:
         pending_verifications = 0
 
         try:
-            from neurons.validator.challenge_status import ChallengeStatus
-            from neurons.validator.models.database import (ComputeChallenge,
-                                                           MeshHubTask,
+            from neurons.validator.models.database import (MeshHubTask,
                                                            MinerInfo,
                                                            WorkerInfo)
 
@@ -816,15 +814,6 @@ class MeshHubClient:
                 total_tasks = q_total.count()
                 success_tasks = q_success.count()
 
-                # Pending verification queue size (VERIFYING)
-                pending_verifications = (
-                    session.query(ComputeChallenge)
-                    .filter(
-                        ComputeChallenge.challenge_status == ChallengeStatus.VERIFYING,
-                        ComputeChallenge.deleted_at.is_(None),
-                    )
-                    .count()
-                )
         except Exception:
             # Keep heartbeat resilient to DB issues
             pass

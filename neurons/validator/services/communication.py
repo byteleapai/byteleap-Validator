@@ -171,11 +171,10 @@ class ValidatorCommunicationService:
             Synapse with session response or error
         """
         peer_hotkey = synapse.dendrite.hotkey if synapse.dendrite else "unknown"
-        peer_address = self.synapse_handler.get_peer_address(synapse)
 
         try:
             self.logger.log_request_start(
-                "handle_session_init", "SessionInit", peer_address
+                "handle_session_init", "SessionInit", peer_hotkey
             )
 
             # Parse session init request
@@ -227,7 +226,7 @@ class ValidatorCommunicationService:
 
             result = CommunicationResult(success=True)
             self.logger.log_request_complete(
-                "handle_session_init", result, peer_address
+                "handle_session_init", result, peer_hotkey
             )
 
             return synapse
@@ -240,7 +239,7 @@ class ValidatorCommunicationService:
 
             result = CommunicationResult(success=False, error_message=str(e))
             self.logger.log_request_complete(
-                "handle_session_init", result, peer_address
+                "handle_session_init", result, peer_hotkey
             )
 
             return synapse
@@ -259,9 +258,8 @@ class ValidatorCommunicationService:
         synapse_type = type(synapse)
         if not hasattr(synapse_type, "PROTOCOL_TYPE"):
             # Treat as protocol mismatch
-            peer_address = self.synapse_handler.get_peer_address(synapse)
             self.logger.log_validation_error(
-                "protocol_mismatch", "Missing PROTOCOL_TYPE", peer_address
+                "protocol_mismatch", "Missing PROTOCOL_TYPE", peer_hotkey
             )
             synapse.response = json.dumps(
                 {
@@ -272,7 +270,6 @@ class ValidatorCommunicationService:
             return synapse
         synapse_type_name = synapse_type.PROTOCOL_TYPE
         peer_hotkey = synapse.dendrite.hotkey if synapse.dendrite else "unknown"
-        peer_address = self.synapse_handler.get_peer_address(synapse)
 
         network_log_id = 0
         result = CommunicationResult(success=False)
@@ -280,7 +277,7 @@ class ValidatorCommunicationService:
         try:
             # Log operation start
             self.logger.log_request_start(
-                "handle_synapse", synapse_type_name, peer_address
+                "handle_synapse", synapse_type_name, peer_hotkey
             )
 
             # Centralized per-hotkey rate limiting before decryption
@@ -324,7 +321,7 @@ class ValidatorCommunicationService:
                                 result.error_message = "rate_limited"
                                 self._rl_blocked_total += 1
                                 self.logger.log_request_complete(
-                                    "handle_synapse", result, peer_address
+                                    "handle_synapse", result, peer_hotkey
                                 )
                                 return synapse
                             # Record current event
@@ -343,7 +340,7 @@ class ValidatorCommunicationService:
                 result.error_code = ErrorCodes.SESSION_REQUIRED
                 result.error_message = f"No processor for {synapse_type_name}"
                 self.logger.log_validation_error(
-                    "processor lookup", result.error_message, peer_address
+                    "processor lookup", result.error_message, peer_hotkey
                 )
                 # Return plaintext error for visibility
                 try:
@@ -393,7 +390,7 @@ class ValidatorCommunicationService:
                             result.error_code = ErrorCodes.SESSION_UNKNOWN
                         result.error_message = error_msg
                     self.logger.log_validation_error(
-                        "session_decryption", error_msg, peer_address
+                        "session_decryption", error_msg, peer_hotkey
                     )
                     # Return unencrypted error response for session issues
                     synapse.response = json.dumps(
@@ -413,7 +410,7 @@ class ValidatorCommunicationService:
                 result.error_code = ErrorCodes.BAD_AAD
                 result.error_message = f"Session decryption failed: {str(e)}"
                 self.logger.log_validation_error(
-                    "session_decryption", result.error_message, peer_address
+                    "session_decryption", result.error_message, peer_hotkey
                 )
                 # Return unencrypted error response so miner can recover
                 synapse.response = json.dumps(
@@ -427,7 +424,7 @@ class ValidatorCommunicationService:
                 result.error_code = ErrorCodes.SESSION_UNKNOWN
                 result.error_message = f"Unexpected session error: {str(e)}"
                 self.logger.log_validation_error(
-                    "session_decryption", result.error_message, peer_address
+                    "session_decryption", result.error_message, peer_hotkey
                 )
                 # Return unencrypted error response for unexpected errors
                 synapse.response = json.dumps(
@@ -479,13 +476,13 @@ class ValidatorCommunicationService:
                 result.error_code = ErrorCodes.DB_ERROR
                 result.error_message = f"Database error during processing: {str(e)}"
                 self.logger.log_validation_error(
-                    "database", result.error_message, peer_address
+                    "database", result.error_message, peer_hotkey
                 )
             except (ValueError, KeyError, AttributeError) as e:
                 result.error_code = ErrorCodes.VALIDATION_FAILED
                 result.error_message = f"Processing validation error: {str(e)}"
                 self.logger.log_validation_error(
-                    "processing", result.error_message, peer_address
+                    "processing", result.error_message, peer_hotkey
                 )
             except Exception as e:
                 result.error_code = ErrorCodes.INVALID_RESPONSE
@@ -589,7 +586,7 @@ class ValidatorCommunicationService:
                     )
 
             # Log completion
-            self.logger.log_request_complete("handle_synapse", result, peer_address)
+            self.logger.log_request_complete("handle_synapse", result, peer_hotkey)
 
             return synapse
 
@@ -599,7 +596,7 @@ class ValidatorCommunicationService:
             bt.logging.error(f"❌ Synapse handling error | error={e}")
 
             # Log completion with error
-            self.logger.log_request_complete("handle_synapse", result, peer_address)
+            self.logger.log_request_complete("handle_synapse", result, peer_hotkey)
 
             return synapse
 

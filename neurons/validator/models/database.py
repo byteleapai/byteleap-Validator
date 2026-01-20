@@ -328,76 +328,6 @@ class HeartbeatRecord(Base):
     )
 
 
-class ComputeChallenge(Base):
-    """Compute challenge record table with worker tracking"""
-
-    __tablename__ = "compute_challenges"
-
-    # Core identification
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    challenge_id = Column(String(128), unique=True, index=True, nullable=False)
-    hotkey = Column(String(256), index=True, nullable=False)
-    worker_id = Column(String(256), index=True)
-
-    # Challenge configuration
-    challenge_type = Column(String(32), nullable=False)
-    challenge_data = Column(JSONType, nullable=False)
-    sent_at = Column(DateTime, nullable=True, index=True)
-    expires_at = Column(DateTime, nullable=True)
-
-    # Phase 1 Response
-    computation_time_ms = Column(Float)
-    computed_at = Column(DateTime)
-    merkle_commitments = Column(JSONType, nullable=True)
-
-    # Phase 2 Response
-    verification_targets = Column(JSONType, nullable=True)
-    debug_info = Column(JSONType, nullable=True)
-
-    # Verification information
-    challenge_status = Column(String(20), nullable=False)
-    verification_result = Column(Boolean, default=None, nullable=True)
-    verification_notes = Column(Text)
-    verification_time_ms = Column(Float)
-    verified_at = Column(DateTime, nullable=True)
-    is_success = Column(Boolean)
-    success_count = Column(Integer, default=0)
-
-    # Audit fields
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    deleted_at = Column(DateTime, nullable=True)
-
-    # Indexes
-    __table_args__ = (
-        Index("idx_challenge_miner_time", "hotkey", "created_at"),
-        Index("idx_challenge_worker_time", "worker_id", "created_at"),
-        Index("idx_challenge_success", "is_success"),
-        Index("idx_challenge_verified", "verified_at"),
-        Index("idx_challenge_expires", "expires_at"),
-        Index("idx_challenge_deleted", "deleted_at"),
-        Index("idx_challenge_status_created", "challenge_status", "created_at"),
-        Index("idx_challenge_hotkey_status", "hotkey", "challenge_status"),
-        # Verification queue ordering (partial)
-        Index(
-            "idx_chal_status_comp_created_active",
-            "challenge_status",
-            "computed_at",
-            "created_at",
-            postgresql_where=text("deleted_at IS NULL"),
-            sqlite_where=text("deleted_at IS NULL"),
-        ),
-        # Availability: verified flag + created_at (partial)
-        Index(
-            "idx_chal_verified_created_active",
-            "verification_result",
-            "created_at",
-            postgresql_where=text("deleted_at IS NULL"),
-            sqlite_where=text("deleted_at IS NULL"),
-        ),
-    )
-
-
 class MeshHubTask(Base):
     """MeshHub task cache table for validator-side persistence."""
 
@@ -625,15 +555,6 @@ class DatabaseManager:
             )
         except Exception:
             deleted["worker_info"] = 0
-
-        try:
-            deleted["compute_challenges"] = (
-                session.query(ComputeChallenge)
-                .filter(ComputeChallenge.created_at < cutoff)
-                .delete(synchronize_session=False)
-            )
-        except Exception:
-            deleted["compute_challenges"] = 0
 
         try:
             deleted["meshhub_tasks"] = (
@@ -915,38 +836,6 @@ class DatabaseManager:
             .all()
         )
 
-    def record_challenge(
-        self,
-        session: Session,
-        challenge_id: str,
-        hotkey: str,
-        challenge_type: str,
-        challenge_data: Dict[str, Any],
-        worker_id: str,
-        matrix_size: Optional[int] = None,
-        challenge_timeout: int = 90,
-    ) -> ComputeChallenge:
-        """Record compute challenge"""
-        from neurons.validator.challenge_status import ChallengeStatus
-
-        now = datetime.utcnow()
-
-        challenge = ComputeChallenge(
-            challenge_id=challenge_id,
-            hotkey=hotkey,
-            worker_id=worker_id,
-            challenge_type=challenge_type,
-            challenge_data=challenge_data,
-            challenge_status=ChallengeStatus.CREATED,
-            created_at=now,
-            expires_at=None,  # Only set when challenge is sent
-        )
-
-        session.add(challenge)
-        session.commit()
-        session.refresh(challenge)
-
-        return challenge
 
     def record_weight_update(
         self,
@@ -1399,79 +1288,6 @@ class DatabaseManager:
             .count()
         )
 
-    def mark_expired_tasks(self, session: Session) -> int:
-        """
-        Mark expired challenges based on expires_at timestamp
-
-        Returns:
-            Number of challenges marked as expired
-        """
-        now = datetime.utcnow()
-
-        # Find expired challenges that haven't been responded to
-        expired_challenges = (
-            session.query(ComputeChallenge)
-            .filter(
-                ComputeChallenge.verification_result.is_(None),
-                ComputeChallenge.expires_at < now,
-                ComputeChallenge.computed_at.is_(None),
-                ComputeChallenge.deleted_at.is_(None),
-            )
-            .all()
-        )
-
-        count = 0
-        for challenge in expired_challenges:
-            # Mark as failed due to timeout
-            challenge.is_success = False
-            # computed_at remains NULL since worker never responded
-            challenge.verified_at = now  # Validator marks as expired
-            challenge.verification_result = False
-            challenge.verification_notes = "Challenge expired - timeout"
-            challenge.updated_at = now
-            count += 1
-
-        if count > 0:
-            session.commit()
-            bt.logging.info(f"Marked {count} expired challenges as failed")
-
-        return count
-
-    def mark_expired_sent_tasks(self, session: Session) -> int:
-        """
-        Mark only sent but expired challenges as failed
-
-        Returns:
-            Number of sent challenges marked as expired
-        """
-        from neurons.validator.challenge_status import ChallengeStatus
-
-        now = datetime.utcnow()
-
-        updated_count = (
-            session.query(ComputeChallenge)
-            .filter(
-                ComputeChallenge.challenge_status == ChallengeStatus.SENT,
-                ComputeChallenge.expires_at < now,
-            )
-            .update(
-                {
-                    "challenge_status": ChallengeStatus.FAILED,
-                    "is_success": False,
-                    "verification_result": False,
-                    "verification_notes": "Challenge timeout after being sent to miner",
-                    "verified_at": now,
-                    "updated_at": now,
-                }
-            )
-        )
-
-        session.commit()
-        bt.logging.debug(
-            f"Marked {updated_count} sent but expired challenges as failed"
-        )
-        return updated_count
-
     def mark_workers_offline_by_deadline(self, session: Session) -> int:
         """
         Mark workers as offline based on next_heartbeat_deadline
@@ -1760,28 +1576,6 @@ class DatabaseManager:
         for row in rows:
             inventory_map[row.worker_id].append(row)
         return inventory_map
-
-    def get_workers_with_pending_challenges(
-        self,
-        session: Session,
-        hotkey: str,
-        worker_ids: List[str],
-        pending_states: List[str],
-    ) -> Set[str]:
-        """Return worker_ids that currently have pending challenges."""
-        if not worker_ids:
-            return set()
-        rows = (
-            session.query(ComputeChallenge.worker_id)
-            .filter(
-                ComputeChallenge.hotkey == hotkey,
-                ComputeChallenge.worker_id.in_(worker_ids),
-                ComputeChallenge.challenge_status.in_(pending_states),
-                ComputeChallenge.deleted_at.is_(None),
-            )
-            .all()
-        )
-        return {worker_id for (worker_id,) in rows}
 
     def get_gpu_by_uuid(
         self, session: Session, gpu_uuid: str

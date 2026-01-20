@@ -18,24 +18,20 @@ class CommunicationLogger:
         self.component_name = component_name
 
     def log_request_start(
-        self, operation: str, synapse_type: str, peer_address: str = "unknown"
+        self, operation: str, synapse_type: str, peer_hotkey: str = "unknown"
     ) -> None:
         """Log start of request processing"""
         bt.logging.debug(
-            f"start | op={operation} type={synapse_type} peer={peer_address}"
+            f"start | op={operation} type={synapse_type} peer={peer_hotkey}"
         )
 
     def log_request_complete(
-        self, operation: str, result: CommunicationResult, peer_address: str = "unknown"
+        self, operation: str, result: CommunicationResult, peer_hotkey: str = "unknown"
     ) -> None:
-        """Log completion of request processing"""
-        if result.success:
-            bt.logging.info(
-                f"✅ done | op={operation} peer={peer_address} time={result.processing_time_ms:.1f}ms"
-            )
-        else:
+        """Log completion of request processing (only errors logged to reduce volume)"""
+        if not result.success:
             bt.logging.error(
-                f"❌ fail | op={operation} peer={peer_address} code={result.error_code} time={result.processing_time_ms:.1f}ms err={result.error_message}"
+                f"fail | op={operation} peer={peer_hotkey} code={result.error_code} err={result.error_message}"
             )
 
     def log_outbound_request(
@@ -71,19 +67,19 @@ class CommunicationLogger:
             bt.logging.debug(f"dec | op={operation} time={decryption_time:.1f}ms")
 
     def log_validation_error(
-        self, operation: str, error_message: str, peer_address: str = "unknown"
+        self, operation: str, error_message: str, peer_hotkey: str = "unknown"
     ) -> None:
         """Log validation errors"""
         bt.logging.warning(
-            f"⚠️ validation | op={operation} peer={peer_address} err={error_message}"
+            f"validation | op={operation} peer={peer_hotkey} err={error_message}"
         )
 
     def log_security_event(
-        self, event_type: str, details: str, peer_address: str = "unknown"
+        self, event_type: str, details: str, peer_hotkey: str = "unknown"
     ) -> None:
         """Log security-related events"""
         bt.logging.warning(
-            f"🔒 security | type={event_type} peer={peer_address} detail={details}"
+            f"security | type={event_type} peer={peer_hotkey} detail={details}"
         )
 
 

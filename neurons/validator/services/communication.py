@@ -85,7 +85,7 @@ from neurons.validator.synapse_processor import SynapseProcessor
 class ValidatorCommunicationService:
     """Validator communication service with network logging and database recording"""
 
-    def __init__(self, wallet: bt.wallet, config: Dict[str, Any], database_manager):
+    def __init__(self, wallet: bt.Wallet, config: Dict[str, Any], database_manager):
         # Core components
         self.wallet = wallet
         self.config = config

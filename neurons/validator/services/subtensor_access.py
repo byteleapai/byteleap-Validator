@@ -1,6 +1,6 @@
 """
 Subtensor access guard
-Serializes access to a shared bt.subtensor instance to avoid thread contention.
+Serializes access to a shared bt.Subtensor instance to avoid thread contention.
 """
 
 import asyncio

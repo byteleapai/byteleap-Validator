@@ -404,7 +404,7 @@ async def main():
     validator = None
     try:
         # Create unified Bittensor config to avoid multiple internal loads
-        bt_config = bt.config()
+        bt_config = bt.Config()
         # Populate required fields from our ConfigManager
         bt_config.netuid = config.get("netuid")
         from munch import DefaultMunch

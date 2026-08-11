@@ -23,7 +23,7 @@ class MetagraphCache:
         self,
         subtensor_guard: SubtensorAccessGuard,
         netuid: int,
-        metagraph: bt.metagraph,
+        metagraph: bt.Metagraph,
         config: ConfigManager,
     ) -> None:
         self._subtensor_guard = subtensor_guard

@@ -95,7 +95,7 @@ class MeshHubClient:
 
     def __init__(
         self,
-        wallet: bt.wallet,
+        wallet: bt.Wallet,
         config: ConfigManager,
         db_manager: DatabaseManager,
         on_fatal: Optional[Callable[[str], None]] = None,

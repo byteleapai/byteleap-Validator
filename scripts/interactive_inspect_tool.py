@@ -112,8 +112,8 @@ def _resolve_validator_uid(mg: Any, query: str) -> Optional[int]:
 
 def load_metagraph(network: str, netuid: int) -> Tuple[Any, Any]:
     bt.logging.info(f"Connect | network={network} netuid={netuid}")
-    subtensor = bt.subtensor(network=network)
-    mg = bt.metagraph(netuid=netuid, subtensor=subtensor)
+    subtensor = bt.Subtensor(network=network)
+    mg = bt.Metagraph(netuid=netuid, subtensor=subtensor)
     # Ensure synced to latest
     try:
         mg.sync()

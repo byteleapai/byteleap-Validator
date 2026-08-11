@@ -29,9 +29,9 @@ class WeightManager:
     def __init__(
         self,
         database_manager: DatabaseManager,
-        wallet: bt.wallet,
+        wallet: bt.Wallet,
         subtensor_guard: SubtensorAccessGuard,
-        metagraph: bt.metagraph,
+        metagraph: bt.Metagraph,
         config: ConfigManager,
         meshhub_client=None,
         metagraph_cache=None,

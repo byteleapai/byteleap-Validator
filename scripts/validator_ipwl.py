@@ -187,8 +187,8 @@ def _ip_from_axon(axon: object) -> Optional[str]:
 
 def _load_metagraph(network: str, netuid: int):
     bt.logging.info(f"Connect | network={network} netuid={netuid}")
-    subtensor = bt.subtensor(network=network)
-    mg = bt.metagraph(netuid=netuid, subtensor=subtensor)
+    subtensor = bt.Subtensor(network=network)
+    mg = bt.Metagraph(netuid=netuid, subtensor=subtensor)
     try:
         mg.sync(subtensor=subtensor)
     except Exception:

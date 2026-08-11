@@ -53,7 +53,7 @@ class Validator:
         self.config = config
 
         # Initialize wallet using provided bt_config (single source of truth)
-        self.wallet = bt.wallet(config=bt_config)
+        self.wallet = bt.Wallet(config=bt_config)
         bt.logging.info(f"🚀 Wallet | name={self.wallet.name}")
         bt.logging.info(f"🔐 Hotkey | name={self.wallet.hotkey_str}")
 
@@ -63,7 +63,7 @@ class Validator:
 
         # Initialize subtensor using provided bt_config
         try:
-            self.subtensor = bt.subtensor(config=bt_config)
+            self.subtensor = bt.Subtensor(config=bt_config)
         except Exception as e:
             bt.logging.error(
                 f"❌ Subtensor init failed | network={self.config.get_non_empty_string('subtensor.network')} | error={e}"
@@ -73,7 +73,7 @@ class Validator:
         self.subtensor_guard = SubtensorAccessGuard(self.subtensor)
 
         # Initialize metagraph and cache service
-        self.metagraph = bt.metagraph(netuid=self.netuid, subtensor=self.subtensor)
+        self.metagraph = bt.Metagraph(netuid=self.netuid, subtensor=self.subtensor)
         self.metagraph_cache = MetagraphCache(
             self.subtensor_guard, self.netuid, self.metagraph, config
         )
@@ -125,7 +125,7 @@ class Validator:
             self.config.get_optional("external_ip")
             or bt.utils.networking.get_external_ip()
         )
-        self.axon = bt.axon(wallet=self.wallet, port=self.port, ip=external_ip)
+        self.axon = bt.Axon(wallet=self.wallet, port=self.port, ip=external_ip)
 
         # Register forward functions
         self._setup_axon_handlers()

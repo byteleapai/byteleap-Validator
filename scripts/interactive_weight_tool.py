@@ -349,15 +349,15 @@ class InteractiveWeightTool:
         bt.logging.info(
             f"🔑 Loading wallet | wallet={wallet_name} hotkey={hotkey_name}"
         )
-        self.wallet = bt.wallet(name=wallet_name, hotkey=hotkey_name)
+        self.wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
 
         bt.logging.info(
             f"🌐 Connecting to subtensor | network={network} netuid={netuid}"
         )
-        self.subtensor = bt.subtensor(network=network)
+        self.subtensor = bt.Subtensor(network=network)
 
         bt.logging.info(f"Loading metagraph | network={network} netuid={netuid}")
-        self.metagraph = bt.metagraph(netuid=netuid, network=network)
+        self.metagraph = bt.Metagraph(netuid=netuid, network=network)
         self.metagraph.sync(subtensor=self.subtensor)
 
         self._subtensor_lock = (
@@ -793,7 +793,7 @@ class InteractiveWeightTool:
             # Set desired external address and push to chain
             # Important: chain uses external_ip for on-chain endpoint, not bind ip.
             # Passing external_ip ensures on-chain value matches provided ip (e.g., 0.0.0.0).
-            ax = bt.axon(wallet=self.wallet, port=port, external_ip=ip)
+            ax = bt.Axon(wallet=self.wallet, port=port, external_ip=ip)
 
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(

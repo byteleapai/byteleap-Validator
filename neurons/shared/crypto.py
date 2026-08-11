@@ -32,7 +32,7 @@ class CryptoManager:
     HANDSHAKE_RETRY_BACKOFF_SECONDS = 5
     NEAR_EXPIRY_THRESHOLD_SECONDS = 300
 
-    def __init__(self, wallet: bt.wallet):
+    def __init__(self, wallet: bt.Wallet):
         """
         Initialize crypto manager with wallet identity
 
